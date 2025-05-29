@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 from typing import BinaryIO
 
+import numpy as np
+
 import pymupdf
 from pdfminer.cmapdb import IdentityCMap
 from pdfminer.pdfdocument import PDFDocument
@@ -50,7 +52,7 @@ from babeldoc.split_manager import SplitManager
 from babeldoc.translation_config import TranslateResult
 from babeldoc.translation_config import TranslationConfig
 from babeldoc.translation_config import WatermarkOutputMode
-
+from babeldoc.docvision.doclayout import DocLayoutModel
 
 def decode(_, code: bytes) -> tuple[int, ...]:
     n = len(code) // 2
@@ -155,24 +157,24 @@ def start_parse_il(
         kwarg.get("prompt", []),
         il_creater=il_creater,
     )
-    # model = DocLayoutModel.load_available()
+    model = DocLayoutModel.load_available()
 
     assert device is not None
     assert il_creater is not None
     assert translation_config is not None
     obj_patch = {}
-    interpreter = PDFPageInterpreterEx(rsrcmgr, device, obj_patch, il_creater)
+    interpreter = PDFPageInterpreterEx(rsrcmgr, device, obj_patch, il_creater) # babeldoc page interpreter
     if pages:
         total_pages = len(pages)
     else:
-        total_pages = doc_zh.page_count
+        total_pages = doc_zh.page_count  # 여기서 binaryIO인 inf가 있는데도, doc_zh를 사용하는 이유는? 
 
     il_creater.on_total_pages(total_pages)
 
-    parser = PDFParser(inf)
-    doc = PDFDocument(parser)
+    parser = PDFParser(inf) # pdf miner parser
+    doc = PDFDocument(parser) # pdf miner document
 
-    for pageno, page in enumerate(PDFPage.create_pages(doc)):
+    for pageno, page in enumerate(PDFPage.create_pages(doc)): # pdf miner page
         if cancellation_event and cancellation_event.is_set():
             raise CancelledError("task cancelled")
         if pages and (pageno not in pages):
@@ -196,6 +198,9 @@ def start_parse_il(
         # but in order to facilitate the migration of pdf2zh,
         # the relevant code is temporarily retained.
         # pix = doc_zh[page.pageno].get_pixmap()
+        # # Save pixmap as PNG
+        # output_path = translation_config.get_working_file_path(f"page_{page.pageno + 1}.png")
+        # save_pixmap_as_png(pix, output_path)
         # image = np.fromstring(pix.samples, np.uint8).reshape(
         #     pix.height, pix.width, 3
         # )[:, :, ::-1]
@@ -931,3 +936,13 @@ def create_cache_folder():
 
 def init():
     create_cache_folder()
+
+
+def save_pixmap_as_png(pix, output_path):
+    """Save pixmap as PNG file.
+    
+    Args:
+        pix: PyMuPDF pixmap object
+        output_path: Path to save the PNG file
+    """
+    pix.save(output_path)

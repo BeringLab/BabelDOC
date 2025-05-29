@@ -163,21 +163,21 @@ class ParagraphFinder:
         )
 
     def process_page(self, page: Page):
-        # 第一步：根据 layout 创建 paragraphs
-        # 在这一步中，page.pdf_character 中的字符会被移除
+        # Step 1: Create paragraphs based on layout
+        # In this step, characters from page.pdf_character will be removed
         paragraphs = self.create_paragraphs(page)
         page.pdf_paragraph = paragraphs
 
-        # 第二步：处理段落中的空格和换行符
+        # Step 2: Process spaces and line breaks in paragraphs
         for paragraph in paragraphs:
             add_space_dummy_chars(paragraph)
             self.process_paragraph_spacing(paragraph)
             self.update_paragraph_data(paragraph)
 
-        # 第三步：计算所有行宽度的中位数
+        # Step 3: Calculate median width of all lines
         median_width = self.calculate_median_line_width(paragraphs)
 
-        # 第四步：处理独立段落
+        # Step 4: Process independent paragraphs
         self.process_independent_paragraphs(paragraphs, median_width)
 
         for paragraph in paragraphs:
@@ -207,6 +207,7 @@ class ParagraphFinder:
 
         # Calculate median character area
         char_areas = []
+        print("page pdf_character", "".join([pc.char_unicode for pc in page.pdf_character]))
         for char in page.pdf_character:
             char_box = char.box
             area = (char_box.x2 - char_box.x) * (char_box.y2 - char_box.y)
@@ -404,7 +405,7 @@ class ParagraphFinder:
 
             return (x_right - x_left) * (y_top - y_bottom)
 
-        # 收集所有相交的布局及其相交面积
+        # 교차하는 모든 레이아웃과 교차 영역 수집
         matching_layouts = []
         for layout in page.page_layout:
             intersection_area = calculate_intersection_area(char_box, layout.box)
@@ -422,7 +423,7 @@ class ParagraphFinder:
         if not matching_layouts:
             return None
 
-        # 按优先级（升序）和相交面积（降序）排序
+        # Sort by priority (ascending) and intersection area (descending)
         matching_layouts.sort(key=lambda x: (x["priority"], -x["area"]))
 
         return matching_layouts[0]["layout"]
@@ -435,7 +436,7 @@ class ParagraphFinder:
         return PdfParagraphComposition(pdf_line=line)
 
     def calculate_median_line_width(self, paragraphs: list[PdfParagraph]) -> float:
-        # 收集所有行的宽度
+        # Collect all line widths
         line_widths = []
         for paragraph in paragraphs:
             for composition in paragraph.pdf_paragraph_composition:
@@ -446,7 +447,7 @@ class ParagraphFinder:
         if not line_widths:
             return 0.0
 
-        # 计算中位数
+        # Calculate median
         line_widths.sort()
         mid = len(line_widths) // 2
         if len(line_widths) % 2 == 0:
@@ -461,7 +462,7 @@ class ParagraphFinder:
         i = 0
         while i < len(paragraphs):
             paragraph = paragraphs[i]
-            if len(paragraph.pdf_paragraph_composition) <= 1:  # 跳过只有一行的段落
+            if len(paragraph.pdf_paragraph_composition) <= 1:  # skip paragraphs with only one line
                 i += 1
                 continue
 
