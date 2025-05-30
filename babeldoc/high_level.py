@@ -139,7 +139,7 @@ def start_parse_il(
     il_creater: ILCreater = None,
     translation_config: TranslationConfig = None,
     **kwarg: Any,
-) -> None:
+) -> list[np.ndarray]:
     rsrcmgr = PDFResourceManager()
     layout = {}
     device = TranslateConverter(
@@ -173,7 +173,7 @@ def start_parse_il(
 
     parser = PDFParser(inf) # pdf miner parser
     doc = PDFDocument(parser) # pdf miner document
-
+    doc_image = []
     for pageno, page in enumerate(PDFPage.create_pages(doc)): # pdf miner page
         if cancellation_event and cancellation_event.is_set():
             raise CancelledError("task cancelled")
@@ -197,13 +197,15 @@ def start_parse_il(
         # the following layout recognition results,
         # but in order to facilitate the migration of pdf2zh,
         # the relevant code is temporarily retained.
-        # pix = doc_zh[page.pageno].get_pixmap()
-        # # Save pixmap as PNG
-        # output_path = translation_config.get_working_file_path(f"page_{page.pageno + 1}.png")
-        # save_pixmap_as_png(pix, output_path)
-        # image = np.fromstring(pix.samples, np.uint8).reshape(
-        #     pix.height, pix.width, 3
-        # )[:, :, ::-1]
+        pix = doc_zh[page.pageno].get_pixmap(matrix=pymupdf.Matrix(3, 3))  # 3x resolution (216 DPI)
+        # Save pixmap as PNG
+        output_path = translation_config.get_working_file_path(f"page_{page.pageno + 1}.png")
+        save_pixmap_as_png(pix, output_path)
+        image = np.fromstring(pix.samples, np.uint8).reshape(
+            pix.height, pix.width, 3
+        )[:, :, ::-1]
+        doc_image.append(image)
+
         # page_layout = model.predict(
         #     image, imgsz=int(pix.height / 32) * 32)[0]
         # # kdtree 是不可能 kdtree 的，不如直接渲染成图片，用空间换时间
@@ -242,6 +244,7 @@ def start_parse_il(
         il_creater.on_page_end()
     il_creater.on_finish()
     device.close()
+    return doc_image
 
 
 def translate(translation_config: TranslationConfig) -> TranslateResult:
@@ -684,7 +687,7 @@ def _do_translate_single(
     xml_converter = XMLConverter()
     logger.debug(f"start parse il from {temp_pdf_path}")
     with Path(temp_pdf_path).open("rb") as f:
-        start_parse_il(
+        doc_image = start_parse_il(
             f,
             doc_zh=doc_pdf2zh,
             resfont=resfont,
@@ -735,7 +738,7 @@ def _do_translate_single(
                 docs,
                 translation_config.get_working_file_path("table_parser.json"),
             )
-    ParagraphFinder(translation_config).process(docs)
+    ParagraphFinder(translation_config).process(docs, doc_image)
     logger.debug(f"finish paragraph finder from {temp_pdf_path}")
     if translation_config.debug:
         xml_converter.write_json(

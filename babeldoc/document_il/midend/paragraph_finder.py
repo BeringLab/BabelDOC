@@ -1,7 +1,9 @@
 import logging
 import random
 import re
-
+import numpy as np
+import os
+from PIL import Image
 from babeldoc.document_il import Box
 from babeldoc.document_il import Document
 from babeldoc.document_il import Page
@@ -18,12 +20,137 @@ from babeldoc.document_il.utils.layout_helper import is_bullet_point
 from babeldoc.document_il.utils.paragraph_helper import is_cid_paragraph
 from babeldoc.document_il.utils.style_helper import WHITE
 from babeldoc.translation_config import TranslationConfig
+from babeldoc.document_il.ocr.ocr_runner import OCR_Runner
+from babeldoc.document_il import PdfStyle, Box, VisualBbox
 
+from datetime import datetime
 logger = logging.getLogger(__name__)
-
 # Base58 alphabet (Bitcoin style, without numbers 0, O, I, l)
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
+def build_ocr_pdf_paragraph(ocr_results, layout_id='ocr-layout', font_id='OCR_FONT', font_size=10):
+    """
+    ocr_results: list of {'text': str, 'bbox': [x0, y0, x1, y1]}
+    Returns: PdfParagraph
+    """
+    characters = []
+    char_id = 0
+
+    for result in ocr_results:
+        text = result['text']
+        x0, y0, x1, y1 = result['bbox']
+
+        # Each character gets its own PdfCharacter
+        for c in text:
+            char_box = Box(x=x0, y=y0, x2=x1, y2=y1)
+            visual_bbox = VisualBbox(box=char_box)
+            pdf_style = PdfStyle(font_id=font_id, font_size=font_size, graphic_state=None)
+
+            pdf_char = PdfCharacter(
+                box=char_box,
+                pdf_character_id=char_id,
+                advance=(x1 - x0) / len(text),
+                char_unicode=c,
+                vertical=False,
+                pdf_style=pdf_style,
+                xobj_id=-1,
+                visual_bbox=visual_bbox
+            )
+            characters.append(pdf_char)
+            char_id += 1
+    if characters:
+    # Wrap characters into a single PdfLine
+        pdf_line = PdfLine(pdf_character=characters)
+
+        # Wrap line into PdfParagraphComposition
+        composition = PdfParagraphComposition(pdf_line=pdf_line)
+
+        # Wrap everything into PdfParagraph
+        paragraph = PdfParagraph(
+            box=Box(x=min(c.box.x for c in characters),
+                    y=min(c.box.y for c in characters),
+                    x2=max(c.box.x2 for c in characters),
+                    y2=max(c.box.y2 for c in characters)),
+            pdf_paragraph_composition=[composition],
+            pdf_style=PdfStyle(font_id=font_id, font_size=font_size, graphic_state=None),
+            unicode=''.join([c.char_unicode for c in characters]),
+            layout_id=layout_id
+        )
+
+        return paragraph
+    else:
+        return None
+
+def run_selective_ocr_on_empty_layouts(page, 
+                                       full_page_image: np.ndarray, 
+                                       ocr_runner: OCR_Runner):
+    """
+    page: current Page object (with .page_layout and .pdf_character)
+    full_page_image: np.array (H, W, 3) from page.get_pixmap()
+    ocr_runner: function that takes cropped image and returns [{'text': ..., 'bbox': [...]}, ...]
+    """
+    # Create debug directory if it doesn't exist
+    debug_dir = f"debug_cropped_images/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    os.makedirs(debug_dir, exist_ok=True)
+
+    h, w = full_page_image.shape[:2]  # Get image dimensions
+
+    # Since we're using 3x resolution (Matrix(3, 3)), we need to scale the coordinates
+    scale_factor = 3.0
+
+    for i, layout in enumerate(page.page_layout):
+        # Check if this layout box already has characters
+        # Convert layout box to image coordinates for comparison
+        layout_x0 = int(layout.box.x * scale_factor)
+        layout_y0 = int(h - layout.box.y2 * scale_factor)  # Flip y coordinate
+        layout_x1 = int(layout.box.x2 * scale_factor)
+        layout_y1 = int(h - layout.box.y * scale_factor)   # Flip y coordinate
+
+        has_text = any(
+            # Convert character box to image coordinates for comparison
+            char.visual_bbox.box.x * scale_factor >= layout_x0 and
+            char.visual_bbox.box.x2 * scale_factor <= layout_x1 and
+            h - char.visual_bbox.box.y2 * scale_factor >= layout_y0 and  # Flip y coordinate
+            h - char.visual_bbox.box.y * scale_factor <= layout_y1       # Flip y coordinate
+            for char in page.pdf_character
+        )
+
+        if not has_text:
+            # Ensure coordinates are within image bounds
+            x0 = max(0, min(layout_x0, w - 1))
+            y0 = max(0, min(layout_y0, h - 1))
+            x1 = max(0, min(layout_x1, w - 1))
+            y1 = max(0, min(layout_y1, h - 1))
+
+            # Crop the layout region
+            cropped_image = full_page_image[y0:y1, x0:x1]  # numpy array is (H, W, C)
+
+            # Save cropped image for debugging
+            debug_filename = f"{debug_dir}/{i}_layout_{x0}_{y0}_{x1}_{y1}.png"
+            Image.fromarray(cropped_image).save(debug_filename)
+            logger.debug(f"Saved cropped image to {debug_filename}")
+
+            ocr_results: list[dict] = ocr_runner.run_on_image(cropped_image)
+
+            # Adjust bbox to full page coordinates and convert to PdfCharacter
+            line_results = []
+            for result in ocr_results:
+                # Convert OCR results back to PDF coordinates
+                adj_bbox = [
+                    (result['bbox'][0] + x0) / scale_factor,
+                    h - (result['bbox'][3] + y0) / scale_factor,  # Flip y coordinate back
+                    (result['bbox'][2] + x0) / scale_factor,
+                    h - (result['bbox'][1] + y0) / scale_factor,  # Flip y coordinate back
+                ]
+                line_results.append({
+                    'text': result['text'],
+                    'bbox': adj_bbox
+                })
+            print(f"{i} debug:" + " ".join([l["text"] for l in line_results]))
+            print("-"*100)
+            pdf_paragraph = build_ocr_pdf_paragraph(line_results)
+            if pdf_paragraph:
+                page.pdf_paragraph.append(pdf_paragraph)
 
 def generate_base58_id(length: int = 5) -> str:
     """Generate a random base58 ID of specified length."""
@@ -125,14 +252,14 @@ class ParagraphFinder:
         max_y = max(char.visual_bbox.box.y2 for char in line.pdf_character)
         line.box = Box(min_x, min_y, max_x, max_y)
 
-    def process(self, document):
+    def process(self, document, doc_image: list[np.ndarray]):
         with self.translation_config.progress_monitor.stage_start(
             self.stage_name,
             len(document.page),
         ) as pbar:
-            for page in document.page:
+            for page, full_page_image in zip(document.page, doc_image):
                 self.translation_config.raise_if_cancelled()
-                self.process_page(page)
+                self.process_page(page, full_page_image)
                 pbar.advance()
 
             total_paragraph_count = 0
@@ -162,7 +289,7 @@ class ParagraphFinder:
             and bbox1.y2 > bbox2.y
         )
 
-    def process_page(self, page: Page):
+    def process_page(self, page: Page, full_page_image: np.ndarray):
         # Step 1: Create paragraphs based on layout
         # In this step, characters from page.pdf_character will be removed
         paragraphs = self.create_paragraphs(page)
@@ -185,7 +312,10 @@ class ParagraphFinder:
 
         if self.translation_config.ocr_workaround:
             self.add_text_fill_background(page)
-            # since this is ocr file,
+            ocr_runner = OCR_Runner()
+            # if self.translation_config.enable_ocr_hook:
+            run_selective_ocr_on_empty_layouts(page, full_page_image, ocr_runner)
+            # since this is ocr file, 
             # image characters are not needed
             page.pdf_character = []
 
@@ -234,9 +364,9 @@ class ParagraphFinder:
                 skip_chars.append(char)
                 continue
 
-            # 检查是否需要开始新行
+            # check if need to start a new line
             if current_line_chars and Layout.is_newline(current_line_chars[-1], char):
-                # 创建新行
+                # create a new line
                 if current_line_chars:
                     line = self.create_line(current_line_chars)
                     if current_paragraph is None:
@@ -259,17 +389,17 @@ class ParagraphFinder:
             char_area = (char_box.x2 - char_box.x) * (char_box.y2 - char_box.y)
             is_small_char = char_area < median_char_area * 0.1
 
-            # 检查是否需要开始新段落
-            # 如果字符面积小于中位数面积的 10% 且当前段落已有字符，则跳过新段落检测
+            # check if need to start a new paragraph
+            # if char area is less than 10% of median char area and current paragraph has chars, skip new paragraph detection
             if not (is_small_char and current_line_chars) and (
                 current_layout is None
                 or char_layout.id != current_layout.id
-                or (  # 不是同一个 xobject
+                or (  # not the same xobject
                     current_line_chars
                     and current_line_chars[-1].xobj_id != char.xobj_id
                 )
                 or (
-                    is_bullet_point(char)  # 如果是项目符号，开启新段落
+                    is_bullet_point(char)  # if it's a bullet point, start a new paragraph
                     and not current_line_chars
                 )
             ):
@@ -293,7 +423,7 @@ class ParagraphFinder:
 
             current_line_chars.append(char)
 
-        # 处理最后一行的字符
+        # process the last line's chars
         if current_line_chars:
             line = self.create_line(current_line_chars)
             if current_paragraph is None:
@@ -316,7 +446,7 @@ class ParagraphFinder:
         if not paragraph.pdf_paragraph_composition:
             return
 
-        # 处理行级别的空格
+        # process the spacing of lines
         processed_lines = []
         for composition in paragraph.pdf_paragraph_composition:
             if not composition.pdf_line:
@@ -326,10 +456,10 @@ class ParagraphFinder:
             line = composition.pdf_line
             if not "".join(
                 x.char_unicode for x in line.pdf_character
-            ).strip():  # 跳过完全空白的行
+            ).strip():  # skip completely blank lines
                 continue
 
-            # 处理行内字符的尾随空格
+            # process the trailing spaces of chars in the line
             processed_chars = []
             for char in line.pdf_character:
                 if not char.char_unicode.isspace():
