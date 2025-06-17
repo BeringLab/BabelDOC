@@ -10,12 +10,9 @@ import unicodedata
 from abc import ABC
 from abc import abstractmethod
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Dict, Union, Optional, Tuple
-from dataclasses import dataclass
+from typing import List, Dict, Union
 from enum import Enum
-import time
-from loguru import logger
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import httpx
 import openai
 from tenacity import retry
@@ -287,7 +284,7 @@ class OpenAITranslator(BaseTranslator):
                 self.prompt_token_count.inc(response.usage.prompt_tokens)
             if response.usage and response.usage.completion_tokens:
                 self.completion_token_count.inc(response.usage.completion_tokens)
-        except Exception as e:
+        except Exception:
             logger.exception("Error updating token count")
 
     def get_formular_placeholder(self, placeholder_id: int):
