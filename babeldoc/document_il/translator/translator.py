@@ -340,7 +340,7 @@ class TranslationRequest:
 
 class TranslatorClient:
     def __init__(self, base_url: str = "http://localhost/", port: int = 8005):
-        self.base_url = base_url.rstrip("/") + f":{port}/"
+        self.base_url = base_url.rstrip("/") + f":{port}"
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def __aenter__(self):
