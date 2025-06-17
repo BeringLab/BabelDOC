@@ -485,8 +485,8 @@ class TranslatorClient:
         """
         Connect to the NATS server.
         """
+        global RUNNING_PDFSP_FUTURE
         if RUNNING_PDFSP_FUTURE is None:
-            global RUNNING_PDFSP_FUTURE
             with ThreadPoolExecutor() as executor:
                 RUNNING_PDFSP_FUTURE = executor.submit(
                     run_in_new_loop(
