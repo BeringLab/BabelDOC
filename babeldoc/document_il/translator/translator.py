@@ -1,21 +1,20 @@
 import asyncio
-import re
+from asyncio.queues import Queue
 import contextlib
+import json
 import logging
 import threading
 import time
+import typing
 import unicodedata
 from abc import ABC
 from abc import abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Union, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
 import time
-import aiohttp
-import json
-import requests
 from loguru import logger
-from pydantic_settings import BaseSettings
 from dataclasses import dataclass, field
 import httpx
 import openai
@@ -25,6 +24,9 @@ from tenacity import stop_after_attempt
 from tenacity import wait_exponential
 from babeldoc.document_il.translator.cache import TranslationCache
 from babeldoc.document_il.utils.atomic_integer import AtomicInteger
+
+from nats.aio.client import Client as NatsClient
+from nats.aio.subscription import Subscription as NATSSubscription
 
 
 logger = logging.getLogger(__name__)
@@ -338,45 +340,232 @@ class TranslationRequest:
         }
 
 
+class SingleSegment(typing.TypedDict):
+    """
+    Represents a single segment of a PDF document.
+    """
+
+    segment_id: int
+    segment: str
+
+
+class PDFJobCreated(typing.TypedDict):
+    """
+    This is a event needed to be sent to the MT-worker from here.
+    If you have `x` segments, you will send `x` of these.
+    NATS subject: `bering_workqueue.MtPdfJob.MtPdfJobCreated`
+    """
+
+    job_id: int
+    source_language: str
+    target_language: str
+    domain: str
+    payload: SingleSegment
+
+
+class ProcessedPayload(typing.TypedDict):
+    """
+    Represents the payload of a processed PDF segment.
+    """
+
+    main_text: list[str]
+
+
+class PDFSegmentProcessed(typing.TypedDict):
+    """
+    This is a event sent from the MT-worker to the Translation-Coordinator.
+    NATS subject: `bering_workqueue.mt_worker.mt_job.MtJobPdfSegmentProcessed`
+    """
+
+    job_id: int
+    segment_id: int
+    target_language: str
+    payload: ProcessedPayload
+
+
+T_AW = typing.TypeVar("T_AW")
+
+
+def run_in_new_loop(awaitable: typing.Awaitable[T_AW]) -> T_AW:
+    """
+    Helper function to run the awaitable in a new event loop.
+    This should be executed in a separate thread.
+    """
+    new_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(new_loop)
+    try:
+        return new_loop.run_until_complete(awaitable)
+    finally:
+        new_loop.close()
+
+
+def run_async_in_sync(awaitable: typing.Awaitable[T_AW]) -> T_AW:
+    """
+    Run an awaitable in a synchronous context.
+    This is useful for running async functions in a sync context.
+    Note that this function invokes given awaitable in a new event loop,
+    so it should be used with caution. (e.g. `asyncio.Queue` etc)
+    """
+    with ThreadPoolExecutor() as executor:
+        return executor.submit(
+            run_in_new_loop,
+            awaitable=awaitable,
+        ).result()
+
+
+async def message_handler_daemon(
+    nats_client: NatsClient,
+    subject: str,
+    f: typing.Callable[[str], typing.Awaitable],
+) -> None:
+    """
+    Daemon to handle incoming messages from the NATS server.
+    """
+    sub: NATSSubscription = await nats_client.subscribe(subject)
+    tasks: set[asyncio.Task] = set()
+    async for msg in sub.messages:
+        logger.debug(
+            "Received message on subject %s: %s",
+            subject,
+            msg.data,
+        )
+        task = asyncio.create_task(f(msg.data.decode()))
+        task.add_done_callback(lambda t: tasks.discard(t))
+        tasks.add(task)
+    await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+
+
+class PDFSPReceiver:
+    def __init__(self) -> None:
+        self._nats_client: NatsClient = NatsClient()
+        self._background_task: asyncio.Task | None = None
+        self.result_cache: dict[int, set[PDFSegmentProcessed]] = {}
+
+    async def connect(self, nats_url: str) -> None:
+        """
+        Connect to the NATS server.
+        This function invokes `self._run()`.
+        """
+        if not self._nats_client.is_connected:
+            await self._nats_client.connect(nats_url)
+        await self._run()
+
+    async def handle_message(self, message: str) -> None:
+        """
+        Handle incoming messages from the NATS server.
+        This is for PDFSP-specific.
+        """
+        actual_body: PDFSegmentProcessed = json.loads(message)
+        logger.info("PDF segment processed: %s", actual_body)
+        job_id: int = actual_body["job_id"]
+        self.result_cache.setdefault(job_id, set()).add(actual_body)
+
+    async def _run(self) -> None:
+        """
+        Run the receiver to listen for messages.
+        """
+        SUBJECT = "bering_workqueue.mt_worker.mt_job.MtJobPdfSegmentProcessed"
+        self._background_task = asyncio.create_task(
+            message_handler_daemon(
+                self._nats_client,
+                SUBJECT,
+                self.handle_message,
+            )
+        )
+
+
+GLOBAL_PDFSP_RECEIVER: PDFSPReceiver = PDFSPReceiver()
+RUNNING_PDFSP_FUTURE: asyncio.Future | None = None
+
+
 class TranslatorClient:
-    def __init__(self, base_url: str = "http://localhost/", port: int = 8005):
-        self.base_url = base_url.rstrip("/") + f":{port}"
-        self._session: Optional[aiohttp.ClientSession] = None
+    def __init__(self, nats_url: str):
+        self._queues: dict[int, Queue] = {}
+        self._nats_url: str = nats_url
+        self.nats_client: NatsClient | None = None
 
-    async def __aenter__(self):
-        self._session = aiohttp.ClientSession()
-        return self
+    async def connect_nats(self):
+        """
+        Connect to the NATS server.
+        """
+        if RUNNING_PDFSP_FUTURE is None:
+            global RUNNING_PDFSP_FUTURE
+            with ThreadPoolExecutor() as executor:
+                RUNNING_PDFSP_FUTURE = executor.submit(
+                    run_in_new_loop(
+                        GLOBAL_PDFSP_RECEIVER.connect(self._nats_url),
+                    )
+                )
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self._session:
-            await self._session.close()
-            self._session = None
+        if self.nats_client is None:
+            self.nats_client = NatsClient()
+            await self.nats_client.connect(self._nats_url)
+
+    async def request_and_retrieve(self, request: TranslationRequest) -> dict:
+        """
+        Translation request rewritten by Minsung Kim;
+        Need significant refactoring later.
+        """
+        if not self.nats_client:
+            await self.connect_nats()
+        assert self.nats_client is not None
+
+        # Publish MtPdfJobCreated
+        SUBJECT = "bering_workqueue.MtPdfJob.MtPdfJobCreated"
+        publishing_coros: list[typing.Coroutine] = []
+        number_of_payloads: int = len(request.payload)
+        job_id: int = request.job_id
+        for segment in request.payload:
+            segment_id: int = segment.segment_id
+            event: PDFJobCreated = {
+                "job_id": job_id,
+                "source_language": request.source_language,
+                "target_language": request.target_language,
+                "domain": request.domain,
+                "payload": {
+                    "segment_id": segment_id,
+                    "segment": segment.segment,
+                },
+            }
+            if segment_id in self._queues:
+                raise RuntimeError(
+                    f"Segment ID {segment_id} already exists in the queue."
+                )
+            self._queues[segment_id] = Queue()
+            publishing_coros.append(
+                self.nats_client.publish(SUBJECT, json.dumps(event).encode())
+            )
+        await asyncio.gather(*publishing_coros)
+
+        # Retrieve results
+        segment_results: set[PDFSegmentProcessed]
+        while True:
+            segment_results = GLOBAL_PDFSP_RECEIVER.result_cache.get(
+                job_id,
+                set(),
+            )
+            if len(segment_results) >= number_of_payloads:
+                # All segments processed
+                break
+            else:
+                await asyncio.sleep(5)
+
+        return {
+            "job_id": job_id,
+            "translated_text_segment": [
+                {"segment": segment["payload"]["main_text"]}
+                for segment in sorted(
+                    segment_results,
+                    key=lambda x: x["segment_id"],
+                )
+            ],
+        }
 
     def translate(self, request: TranslationRequest) -> Dict:
         """
         Synchronous translation request
         """
-        url = f"{self.base_url}/translate"
-        logger.debug(request.to_dict())
-        response = requests.post(
-            url, headers={"Content-Type": "application/json"}, json=request.to_dict()
-        )
-        response.raise_for_status()
-        return response.json()
-
-    async def translate_async(self, request: TranslationRequest) -> Dict:
-        """
-        Asynchronous translation request
-        """
-        if not self._session:
-            self._session = aiohttp.ClientSession()
-
-        url = f"{self.base_url}/translate"
-        async with self._session.post(
-            url, headers={"Content-Type": "application/json"}, json=request.to_dict()
-        ) as response:
-            response.raise_for_status()
-            return await response.json()
+        return run_async_in_sync(self.request_and_retrieve(request))
 
 
 # Usage examples:
