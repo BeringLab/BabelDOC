@@ -3,6 +3,7 @@ from asyncio.queues import Queue
 import contextlib
 import json
 import logging
+import os
 import threading
 import time
 import typing
@@ -97,15 +98,6 @@ class BaseTranslator(ABC):
 
         self.translate_call_count = 0
         self.translate_cache_call_count = 0
-
-    def __del__(self):
-        with contextlib.suppress(Exception):
-            logger.info(
-                f"{self.name} translate call count: {self.translate_call_count}"
-            )
-            logger.info(
-                f"{self.name} translate cache call count: {self.translate_cache_call_count}",
-            )
 
     def add_cache_impact_parameters(self, k: str, v):
         """
@@ -383,19 +375,6 @@ class PDFSegmentProcessed(typing.TypedDict):
 T_AW = typing.TypeVar("T_AW")
 
 
-def run_in_new_loop(awaitable: typing.Awaitable[T_AW]) -> T_AW:
-    """
-    Helper function to run the awaitable in a new event loop.
-    This should be executed in a separate thread.
-    """
-    new_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(new_loop)
-    try:
-        return new_loop.run_until_complete(awaitable)
-    finally:
-        new_loop.close()
-
-
 def run_async_in_sync(awaitable: typing.Awaitable[T_AW]) -> T_AW:
     """
     Run an awaitable in a synchronous context.
@@ -405,8 +384,8 @@ def run_async_in_sync(awaitable: typing.Awaitable[T_AW]) -> T_AW:
     """
     with ThreadPoolExecutor() as executor:
         return executor.submit(
-            run_in_new_loop,
-            awaitable=awaitable,
+            asyncio.run,
+            main=awaitable,
         ).result()
 
 
@@ -419,6 +398,7 @@ async def message_handler_daemon(
     Daemon to handle incoming messages from the NATS server.
     """
     sub: NATSSubscription = await nats_client.subscribe(subject)
+    logger.info("NATS receiver daemon started for subject: %s", subject)
     tasks: set[asyncio.Task] = set()
     async for msg in sub.messages:
         logger.debug(
@@ -487,11 +467,11 @@ class TranslatorClient:
         """
         global RUNNING_PDFSP_FUTURE
         if RUNNING_PDFSP_FUTURE is None:
+            logger.info("Starting PDFSP receiver daemon...")
             with ThreadPoolExecutor() as executor:
                 RUNNING_PDFSP_FUTURE = executor.submit(
-                    run_in_new_loop(
-                        GLOBAL_PDFSP_RECEIVER.connect(self._nats_url),
-                    )
+                    asyncio.run,
+                    main=GLOBAL_PDFSP_RECEIVER.connect(self._nats_url),
                 )
 
         if self.nats_client is None:
@@ -562,6 +542,7 @@ class TranslatorClient:
         """
         Synchronous translation request
         """
+        logger.info("Translating request: %s", request)
         return run_async_in_sync(self.request_and_retrieve(request))
 
 
@@ -653,18 +634,22 @@ class BeringTranslator(BaseTranslator):
     # lang_in, lang_out, ignore_cache
     def __init__(
         self,
-        lang_in=None,
-        lang_out=None,
-        model=None,
-        job_id=None,
-        ignore_cache=False,
-        rate_limit_params=None,
         *,
+        lang_in: str,
+        lang_out: str,
+        model,
+        job_id: int,
+        ignore_cache: bool = False,
+        rate_limit_params=None,
         port: int,
         **kwargs,
     ):
-        super().__init__(lang_in, lang_out, model, job_id, ignore_cache)
-        self.client = TranslatorClient(port=port)
+        super().__init__(lang_in, lang_out, ignore_cache)
+        self.client = TranslatorClient(
+            nats_url=os.getenv("NATS_URL", "WTF NO NATS URL GIVEN")
+        )
+        self.model = model
+        self.job_id = job_id
 
     def validate_translate_args(self, job_id, lang_in, lang_out, domain):
         if not isinstance(job_id, int):
@@ -680,7 +665,8 @@ class BeringTranslator(BaseTranslator):
     def parse_result(self, result: Dict) -> str:
         """
         Parse the translation result from the API response.
-        Expected format: {'job_id': int, 'translated_text_segment': [{'segment': str}]}
+        Expected format: `{'job_id': int,
+        'translated_text_segment': [{'segment': str}]}`
         """
         if not isinstance(result, dict):
             raise ValueError("Invalid response format: expected dictionary")
@@ -693,12 +679,14 @@ class BeringTranslator(BaseTranslator):
         segments = result["translated_text_segment"]
         if not segments or not isinstance(segments, list):
             raise ValueError(
-                "Invalid response format: 'translated_text_segment' should be a non-empty list"
+                "Invalid response format: 'translated_text_segment' "
+                "should be a non-empty list"
             )
 
         if not segments[0].get("segment"):
             raise ValueError(
-                "Invalid response format: missing 'segment' in translated_text_segment"
+                "Invalid response format: missing 'segment' in "
+                "translated_text_segment"
             )
 
         return " ".join([segment["segment"] for segment in segments])
