@@ -632,7 +632,7 @@ class TranslatorClient:
         """
         Synchronous translation request
         """
-        self.request_and_retrieve(request)
+        return self.request_and_retrieve(request)
 
 
 # Usage examples:
