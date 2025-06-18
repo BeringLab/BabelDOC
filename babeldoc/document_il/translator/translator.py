@@ -617,7 +617,7 @@ class TranslatorClient:
             segment_id: int = decoded["segment_id"]
             segment_results.append(decoded)
 
-        return {
+        final_result = {
             "job_id": job_id,
             "translated_text_segment": [
                 {"segment": segment["payload"]["main_text"]}
@@ -627,6 +627,12 @@ class TranslatorClient:
                 )
             ],
         }
+        logger.debug(
+            "Translation result for job_id %s: %s",
+            job_id,
+            final_result,
+        )
+        return final_result
 
     def translate(self, request: TranslationRequest) -> Dict:
         """
@@ -778,7 +784,7 @@ class BeringTranslator(BaseTranslator):
                 "translated_text_segment"
             )
 
-        return " ".join([segment["segment"] for segment in segments])
+        return " ".join([" ".join(segment["segment"]) for segment in segments])
 
     def do_translate(
         self,
