@@ -605,7 +605,7 @@ class TranslatorClient:
             GLOBAL_NATS_CLIENT.publish(SUBJECT, json.dumps(event).encode())
 
         # Retrieve results
-        segment_results: set[PDFSegmentProcessed] = set()
+        segment_results: list[PDFSegmentProcessed] = []
         for (
             decoded
         ) in GLOBAL_NATS_CLIENT.segment_processed_storage.get_processed_segments(
@@ -615,7 +615,7 @@ class TranslatorClient:
             if decoded["job_id"] != job_id:
                 continue
             segment_id: int = decoded["segment_id"]
-            segment_results.add(decoded)
+            segment_results.append(decoded)
 
         return {
             "job_id": job_id,
