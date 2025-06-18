@@ -1,9 +1,9 @@
 import asyncio
 from asyncio.queues import Queue
-import contextlib
 import json
 import logging
 import os
+import random
 import threading
 import time
 import typing
@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Union
 from enum import Enum
 from dataclasses import dataclass
+from queue import Queue as SyncQueue
 import httpx
 import openai
 from tenacity import retry
@@ -375,122 +376,219 @@ class PDFSegmentProcessed(typing.TypedDict):
 T_AW = typing.TypeVar("T_AW")
 
 
-def run_async_in_sync(awaitable: typing.Awaitable[T_AW]) -> T_AW:
-    """
-    Run an awaitable in a synchronous context.
-    This is useful for running async functions in a sync context.
-    Note that this function invokes given awaitable in a new event loop,
-    so it should be used with caution. (e.g. `asyncio.Queue` etc)
-    """
-    with ThreadPoolExecutor() as executor:
-        return executor.submit(
-            asyncio.run,
-            main=awaitable,
-        ).result()
-
-
 async def message_handler_daemon(
-    nats_client: NatsClient,
     subject: str,
-    f: typing.Callable[[str], typing.Awaitable],
-) -> None:
+    handler: typing.Callable[[str], typing.Awaitable],
+):
     """
-    Daemon to handle incoming messages from the NATS server.
+    Legacy function just refactored to fit the new patch.
+    This can be deleted, but I have no time to care all of this right now.
     """
-    sub: NATSSubscription = await nats_client.subscribe(subject)
-    logger.info("NATS receiver daemon started for subject: %s", subject)
-    tasks: set[asyncio.Task] = set()
-    async for msg in sub.messages:
-        logger.debug(
-            "Received message on subject %s: %s",
-            subject,
-            msg.data,
-        )
-        task = asyncio.create_task(f(msg.data.decode()))
-        task.add_done_callback(lambda t: tasks.discard(t))
-        tasks.add(task)
-    await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+    async for message in GLOBAL_NATS_CLIENT.get_messages(subject):
+        await handler(message)
 
 
-class PDFSPReceiver:
+class SegmentProcessedStorage:
+    """
+    Storage for processed segment events.
+    """
+
+    SUBJECT = "bering_workqueue.mt_worker.mt_job.MtJobPdfSegmentProcessed"
+
+    def __init__(self, nats_client: "GeneralNATSClient"):
+        self._nats_client = nats_client
+        self._processed_segments: dict[int, list[PDFSegmentProcessed]] = {}
+
+    async def daemon(self) -> None:
+        if self.SUBJECT not in self._nats_client.ongoing_subscriptions:
+            self._nats_client.subscribe(self.SUBJECT)
+            await asyncio.sleep(3)
+        async for message in self._nats_client.get_messages(self.SUBJECT):
+            try:
+                decoded: PDFSegmentProcessed = json.loads(message)
+                logger.info("Received PDFSegmentProcessed: %s", decoded)
+                job_id: int = decoded["job_id"]
+                if job_id not in self._processed_segments:
+                    self._processed_segments[job_id] = []
+                self._processed_segments[job_id].append(decoded)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to decode JSON: {e}")
+                continue
+            except KeyError as e:
+                logger.error(f"Missing key in message: {e}")
+                continue
+
+    def get_processed_segments(
+        self, job_id: int, max_capacity: int, sleep_interval: float = 1.0
+    ):
+        """
+        Synchronously retrieve processed segments for a job ID.
+        """
+        while max_capacity > 0:
+            if ls := self._processed_segments.get(job_id):
+                yield ls.pop()
+                max_capacity -= 1
+            else:
+                time.sleep(sleep_interval)
+
+
+async def move_queue(old_queue: Queue) -> Queue:
+    """
+    Move all items from old_queue to new_queue.
+    This is used to move the subscription commands to a new queue.
+    """
+    new_queue = Queue()
+    while not old_queue.empty():
+        item = old_queue.get_nowait()
+        await new_queue.put(item)
+    return new_queue
+
+
+class GeneralNATSClient:
+    """
+    NATS receiver for all messages.
+    This client can be used across multiple threads.
+    """
+
     def __init__(self) -> None:
         self._nats_client: NatsClient = NatsClient()
-        self._background_task: asyncio.Task | None = None
-        self.result_cache: dict[int, set[PDFSegmentProcessed]] = {}
+        self._received_messages: dict[
+            str, tuple[NATSSubscription, asyncio.Task, SyncQueue[str]]
+        ] = {}
+        self._subscription_commands: Queue[str] = Queue()
+        self.ongoing_subscriptions: set[str] = set()
+        self._publish_queue: Queue[tuple[str, bytes]] = Queue()
+        self.segment_processed_storage: SegmentProcessedStorage = (
+            SegmentProcessedStorage(self)
+        )
+        self._background_threads: set = set()
 
-    async def connect(self, nats_url: str) -> None:
+    def is_connected(self) -> bool:
+        return self._nats_client.is_connected
+
+    def subscribe(self, subject: str) -> None:
+        """
+        Subscribe to a subject.
+        This function will run in the background and listen for messages.
+        """
+        self._subscription_commands.put_nowait(subject)
+        logger.info("Subscription command added; Subject '%s'", subject)
+
+    def publish(self, subject: str, data: bytes) -> None:
+        """
+        Publish a message to a subject.
+        This function will run in the background and publish messages.
+        """
+        self._publish_queue.put_nowait((subject, data))
+        logger.info("Publish command added for subject '%s'", subject)
+
+    async def connect_async(self, nats_url: str) -> None:
         """
         Connect to the NATS server.
-        This function invokes `self._run()`.
+        This should run in a separate thread.
         """
         if not self._nats_client.is_connected:
             await self._nats_client.connect(nats_url)
-        await self._run()
+            logger.info(
+                "Connected to NATS server at %s in thread %s",
+                nats_url,
+                threading.get_ident(),
+            )
 
-    async def handle_message(self, message: str) -> None:
-        """
-        Handle incoming messages from the NATS server.
-        This is for PDFSP-specific.
-        """
-        actual_body: PDFSegmentProcessed = json.loads(message)
-        logger.info("PDF segment processed: %s", actual_body)
-        job_id: int = actual_body["job_id"]
-        self.result_cache.setdefault(job_id, set()).add(actual_body)
+        await asyncio.gather(
+            self._endless_subscriptions(),
+            self._endless_publishing(),
+        )
 
-    async def _run(self) -> None:
+    async def _endless_subscriptions(self) -> None:
         """
         Run the receiver to listen for messages.
         """
-        SUBJECT = "bering_workqueue.mt_worker.mt_job.MtJobPdfSegmentProcessed"
-        self._background_task = asyncio.create_task(
-            message_handler_daemon(
-                self._nats_client,
-                SUBJECT,
-                self.handle_message,
+        logger.info("Starting endless subscription loop..")
+        self._subscription_commands = await move_queue(self._subscription_commands)
+        while True:
+            try:
+                subject: str = self._subscription_commands.get_nowait()
+            except asyncio.QueueEmpty:
+                await asyncio.sleep(1.0)
+                continue
+            if subject not in self._received_messages:
+                queue: SyncQueue[str] = SyncQueue()
+                sub: NATSSubscription = await self._nats_client.subscribe(subject)
+                task = asyncio.create_task(self._endless_consuming(sub, queue))
+                self._received_messages[subject] = (sub, task, queue)
+                logger.info("Subscribed subject '%s'", subject)
+                self.ongoing_subscriptions.add(subject)
+
+    async def _endless_publishing(self) -> None:
+        """
+        Run the publisher to send messages.
+        This function runs in the background and publishes messages.
+        """
+        logger.info("Starting endless publishing loop..")
+        self._publish_queue = await move_queue(self._publish_queue)
+        while True:
+            try:
+                subject, data = self._publish_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                await asyncio.sleep(1.0)
+            else:
+                await self._nats_client.publish(subject, data)
+                logger.info("Published message to subject '%s'", subject)
+
+    @staticmethod
+    async def _endless_consuming(
+        subscription: NATSSubscription,
+        queue: SyncQueue,
+    ) -> None:
+        """
+        Consume messages from the subscription and put them into the queue.
+        This is a coroutine that runs in the background.
+        """
+        async for msg in subscription.messages:
+            logger.debug(
+                "Received message on subject %s: %s",
+                subscription.subject,
+                msg.data,
             )
-        )
+            queue.put(msg.data.decode())
+
+    async def get_messages(
+        self, subject: str, sleep_interval: float = 1.0
+    ) -> typing.AsyncGenerator[str, None]:
+        """
+        Get messages from the subject.
+        This function can be used in different threads,
+        because this does not rely on `asyncio.Queue`.
+        """
+        while subject not in self._received_messages:
+            logger.warning(
+                "Subject '%s' is not subscribed yet, waiting...",
+                subject,
+            )
+            await asyncio.sleep(sleep_interval)
+        q = self._received_messages[subject][2]
+        while True:
+            if not q.empty():
+                yield q.get()
+            else:
+                await asyncio.sleep(sleep_interval)
 
 
-GLOBAL_PDFSP_RECEIVER: PDFSPReceiver = PDFSPReceiver()
-RUNNING_PDFSP_FUTURE: asyncio.Future | None = None
+GLOBAL_NATS_CLIENT = GeneralNATSClient()
 
 
 class TranslatorClient:
     def __init__(self, nats_url: str):
-        self._queues: dict[int, Queue] = {}
         self._nats_url: str = nats_url
-        self.nats_client: NatsClient | None = None
 
-    async def connect_nats(self):
-        """
-        Connect to the NATS server.
-        """
-        global RUNNING_PDFSP_FUTURE
-        if RUNNING_PDFSP_FUTURE is None:
-            logger.info("Starting PDFSP receiver daemon...")
-            with ThreadPoolExecutor() as executor:
-                RUNNING_PDFSP_FUTURE = executor.submit(
-                    asyncio.run,
-                    main=GLOBAL_PDFSP_RECEIVER.connect(self._nats_url),
-                )
-
-        if self.nats_client is None:
-            self.nats_client = NatsClient()
-            await self.nats_client.connect(self._nats_url)
-
-    async def request_and_retrieve(self, request: TranslationRequest) -> dict:
+    def request_and_retrieve(self, request: TranslationRequest) -> dict:
         """
         Translation request rewritten by Minsung Kim;
         Need significant refactoring later.
         """
-        if not self.nats_client:
-            await self.connect_nats()
-        assert self.nats_client is not None
-
         # Publish MtPdfJobCreated
         SUBJECT = "bering_workqueue.MtPdfJob.MtPdfJobCreated"
-        publishing_coros: list[typing.Coroutine] = []
-        number_of_payloads: int = len(request.payload)
         job_id: int = request.job_id
         for segment in request.payload:
             segment_id: int = segment.segment_id
@@ -504,28 +602,20 @@ class TranslatorClient:
                     "segment": segment.segment,
                 },
             }
-            if segment_id in self._queues:
-                raise RuntimeError(
-                    f"Segment ID {segment_id} already exists in the queue."
-                )
-            self._queues[segment_id] = Queue()
-            publishing_coros.append(
-                self.nats_client.publish(SUBJECT, json.dumps(event).encode())
-            )
-        await asyncio.gather(*publishing_coros)
+            GLOBAL_NATS_CLIENT.publish(SUBJECT, json.dumps(event).encode())
 
         # Retrieve results
-        segment_results: set[PDFSegmentProcessed]
-        while True:
-            segment_results = GLOBAL_PDFSP_RECEIVER.result_cache.get(
-                job_id,
-                set(),
-            )
-            if len(segment_results) >= number_of_payloads:
-                # All segments processed
-                break
-            else:
-                await asyncio.sleep(5)
+        segment_results: set[PDFSegmentProcessed] = set()
+        for (
+            decoded
+        ) in GLOBAL_NATS_CLIENT.segment_processed_storage.get_processed_segments(
+            job_id,
+            len(request.payload),
+        ):
+            if decoded["job_id"] != job_id:
+                continue
+            segment_id: int = decoded["segment_id"]
+            segment_results.add(decoded)
 
         return {
             "job_id": job_id,
@@ -542,8 +632,7 @@ class TranslatorClient:
         """
         Synchronous translation request
         """
-        logger.info("Translating request: %s", request)
-        return run_async_in_sync(self.request_and_retrieve(request))
+        self.request_and_retrieve(request)
 
 
 # Usage examples:
@@ -697,7 +786,7 @@ class BeringTranslator(BaseTranslator):
         rate_limit_params: dict = None,
     ) -> str:
         logger.info(f"translate: {text}")
-        job_id = self.job_id or 123
+        job_id = self.job_id or random.randint(1, 10**9)
         lang_in = self.lang_in
         lang_out = self.lang_out
         domain = self.model
