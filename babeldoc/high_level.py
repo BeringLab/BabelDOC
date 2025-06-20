@@ -832,7 +832,7 @@ def generate_first_page_with_watermark(
     translation_config: TranslationConfig,
     doc_il: il_version_1.Document,
     mediabox_data: dict[int, Any] | None = None,
-) -> (io.BytesIO, io.BytesIO):
+) -> tuple[io.BytesIO, io.BytesIO]:
     first_page_doc = Document()
     first_page_doc.insert_pdf(mupdf, from_page=0, to_page=0)
 
