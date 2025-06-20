@@ -8,7 +8,6 @@ import threading
 import time
 import typing
 import unicodedata
-import time
 from abc import ABC
 from abc import abstractmethod
 from concurrent.futures import ThreadPoolExecutor
@@ -389,7 +388,6 @@ async def message_handler_daemon(
         await handler(message)
 
 
-
 class SegmentProcessedStorage:
     """
     Storage for processed segment events.
@@ -399,81 +397,38 @@ class SegmentProcessedStorage:
 
     def __init__(self, nats_client: "GeneralNATSClient"):
         self._nats_client = nats_client
-        self._processed_segments: dict[int, dict[int, dict]] = {}
+        self._processed_segments: dict[int, list[PDFSegmentProcessed]] = {}
 
     async def daemon(self) -> None:
-        logger.info(f"SegmentProcessedStorage.daemon starting for subject: {self.SUBJECT}")
         if self.SUBJECT not in self._nats_client.ongoing_subscriptions:
-            logger.info(f"Attempting to subscribe to {self.SUBJECT}")
             self._nats_client.subscribe(self.SUBJECT)
-            await asyncio.sleep(3) # Consider if this sleep is always needed or can be shorter/conditional
-        
-        logger.info(f"Starting message loop for {self.SUBJECT}")
+            await asyncio.sleep(3)
         async for message in self._nats_client.get_messages(self.SUBJECT):
-            logger.debug(f"Raw message received on {self.SUBJECT}: {message}")
             try:
                 decoded: PDFSegmentProcessed = json.loads(message)
-                job_id_in_msg = decoded.get("job_id")
-                segment_id_in_msg = decoded.get("segment_id")
-                logger.info(f"Decoded message for job_id: {job_id_in_msg}, segment_id: {segment_id_in_msg}, Full: {decoded}")
-
-                if job_id_in_msg is None or segment_id_in_msg is None:
-                    logger.error(f"Missing job_id or segment_id in decoded message: {decoded}")
-                    continue
-
-                job_id: int = int(job_id_in_msg)
-                segment_id: int = int(segment_id_in_msg)
-                
-                logger.debug(f"Storing for job_id={job_id} (type: {type(job_id)}), segment_id={segment_id} (type: {type(segment_id)})")
+                logger.info("Received PDFSegmentProcessed: %s", decoded)
+                job_id: int = decoded["job_id"]
                 if job_id not in self._processed_segments:
-                    self._processed_segments[job_id] = {}
-                self._processed_segments[job_id][segment_id] = decoded
-                logger.debug(f"Current storage for job {job_id} after adding segment {segment_id}: {self._processed_segments[job_id].keys()}")
+                    self._processed_segments[job_id] = []
+                self._processed_segments[job_id].append(decoded)
             except json.JSONDecodeError as e:
-                logger.error(f"Failed to decode JSON: {message}, Error: {e}")
+                logger.error(f"Failed to decode JSON: {e}")
                 continue
-            except KeyError as e: # Should be less likely with .get and checks
-                logger.error(f"Missing key in message processing: {e}, Message: {decoded}")
-                continue
-            except ValueError as e: # For int conversion errors
-                logger.error(f"Failed to convert job_id/segment_id to int: {e}, Message: {decoded}")
+            except KeyError as e:
+                logger.error(f"Missing key in message: {e}")
                 continue
 
     def get_processed_segments(
-        self, job_id: int, target_segment_ids: set[int], sleep_interval: float = 1.0
+        self, job_id: int, max_capacity: int, sleep_interval: float = 1.0
     ):
         """
-        Synchronously retrieve specific processed segments for a job ID based on their segment_ids.
-        Yields segments as they become available until all target_segment_ids are retrieved.
+        Synchronously retrieve processed segments for a job ID.
         """
-        logger.info(f"[SegmentStorage] get_processed_segments called for job_id: {job_id}, target_ids: {target_segment_ids}")
-        retrieved_segments_count = 0
-        expected_count = len(target_segment_ids)
-
-        while retrieved_segments_count < expected_count:
-            found_one_in_iteration = False
-            if job_storage := self._processed_segments.get(job_id):
-                for seg_id_to_find in list(job_storage.keys()): 
-                    if seg_id_to_find in target_segment_ids:
-                        if seg_id_to_find in job_storage:
-                            segment_data = job_storage.pop(seg_id_to_find)
-                            yield segment_data
-                            retrieved_segments_count += 1
-                            found_one_in_iteration = True
-                            if not job_storage:
-                                del self._processed_segments[job_id]
-                            if retrieved_segments_count == expected_count:
-                                break
-            
-            if retrieved_segments_count == expected_count:
-                break
-
-            if not found_one_in_iteration:
-                logger.info(
-                    f"[SegmentStorage] Job {job_id}: Waiting for segments. "
-                    f"Needed: {expected_count - retrieved_segments_count} more. Target IDs: {target_segment_ids}. "
-                    f"Currently in storage for this job: {list(self._processed_segments.get(job_id, {}).keys())}"
-                )
+        while max_capacity > 0:
+            if ls := self._processed_segments.get(job_id):
+                yield ls.pop()
+                max_capacity -= 1
+            else:
                 time.sleep(sleep_interval)
 
 
@@ -543,9 +498,7 @@ class GeneralNATSClient:
         await asyncio.gather(
             self._endless_subscriptions(),
             self._endless_publishing(),
-            self.segment_processed_storage.daemon(), # Ensure SegmentProcessedStorage daemon is also started
         )
-        logger.info("All NATS background tasks (subscriptions, publishing, segment_storage_daemon) gathered.")
 
     async def _endless_subscriptions(self) -> None:
         """
@@ -628,60 +581,41 @@ GLOBAL_NATS_CLIENT = GeneralNATSClient()
 class TranslatorClient:
     def __init__(self, nats_url: str):
         self._nats_url: str = nats_url
-        self._current_segment_id_counter = 0 # Initialize segment ID counter
-
-    def _generate_segment_id(self) -> int:
-        # Simple counter-based ID for this instance. 
-        # Consider a more robust global ID generation if needed across multiple instances or restarts for the same job_id.
-        self._current_segment_id_counter += 1
-        return self._current_segment_id_counter
 
     def request_and_retrieve(self, request: TranslationRequest) -> dict:
         """
         Translation request rewritten by Minsung Kim;
         Need significant refactoring later.
         """
-        # Publish segment translation requests
-        TRANSLATION_REQUEST_SUBJECT = "bering_workqueue.MtPdfJob.MtPdfJobCreated"
+        # Publish MtPdfJobCreated
+        SUBJECT = "bering_workqueue.MtPdfJob.MtPdfJobCreated"
         job_id: int = request.job_id
-        logger.info(f"[TranslatorClient] Starting request_and_retrieve for job_id: {job_id}")
-        published_segment_ids: set[int] = set()
-
-        for segment_payload_item in request.payload:
-            segment_id = self._generate_segment_id()
-            published_segment_ids.add(segment_id)
-            
-            event_data = {
+        for segment in request.payload:
+            segment_id: int = segment.segment_id
+            event: PDFJobCreated = {
                 "job_id": job_id,
-                "segment_id": segment_id,
+                "source_language": request.source_language,
                 "target_language": request.target_language,
-                "segment": segment_payload_item.segment,
+                "domain": request.domain,
+                "payload": {
+                    "segment_id": segment_id,
+                    "segment": segment.segment,
+                },
             }
-            logger.debug(f"Publishing segment for translation to {TRANSLATION_REQUEST_SUBJECT}: {event_data}")
-            GLOBAL_NATS_CLIENT.publish(TRANSLATION_REQUEST_SUBJECT, json.dumps(event_data).encode())
+            GLOBAL_NATS_CLIENT.publish(SUBJECT, json.dumps(event).encode())
 
-        # Retrieve results for the specific segment_ids published in this call
-        logger.info(f"[TranslatorClient] Calling get_processed_segments for job_id: {job_id} with target_segment_ids: {published_segment_ids}")
-        processed_segments_data = []
-        for segment_data in GLOBAL_NATS_CLIENT.segment_processed_storage.get_processed_segments(
+        # Retrieve results
+        segment_results: list[PDFSegmentProcessed] = []
+        for (
+            decoded
+        ) in GLOBAL_NATS_CLIENT.segment_processed_storage.get_processed_segments(
             job_id,
-            published_segment_ids, # Pass the set of segment_ids
+            len(request.payload),
         ):
-            # The job_id check might be slightly less critical if get_processed_segments is robust per job_id storage,
-            # but good for an assertion/extra safety.
-            if segment_data.get("job_id") != job_id:
-                logger.warning(f"Received segment for wrong job_id! Expected {job_id}, Got {segment_data.get('job_id')}. Skipping.")
+            if decoded["job_id"] != job_id:
                 continue
-            processed_segments_data.append(segment_data)
-            logger.debug(
-                f"Job ID {job_id}: Collected segment_id {segment_data.get('segment_id')}."
-                f" Total collected: {len(processed_segments_data)}/{len(published_segment_ids)}"
-            )
-
-        # Ensure all requested segments were actually retrieved
-        retrieved_ids = {item.get('segment_id') for item in processed_segments_data}
-        if not retrieved_ids == published_segment_ids:
-            logger.warning(f"Job ID {job_id}: Mismatch in retrieved segments! Expected: {published_segment_ids}, Got: {retrieved_ids}")
+            segment_id: int = decoded["segment_id"]
+            segment_results.append(decoded)
 
         final_result = {
             "job_id": job_id,
@@ -693,7 +627,6 @@ class TranslatorClient:
                 )
             ],
         }
-        # TODO: Fix the bug related to the unsorted segments
         logger.debug(
             "Translation result for job_id %s: %s",
             job_id,
