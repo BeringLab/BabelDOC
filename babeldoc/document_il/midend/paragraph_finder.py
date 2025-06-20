@@ -396,7 +396,7 @@ class ParagraphFinder:
 
         # Calculate median character area
         char_areas = []
-        print("page pdf_character", "".join([pc.char_unicode for pc in page.pdf_character]))
+        # print("page pdf_character", "".join([pc.char_unicode for pc in page.pdf_character]))
         for char in page.pdf_character:
             char_box = char.box
             area = (char_box.x2 - char_box.x) * (char_box.y2 - char_box.y)
