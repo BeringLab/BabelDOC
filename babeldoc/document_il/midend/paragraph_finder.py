@@ -12,6 +12,9 @@ from babeldoc.document_il import PdfLine
 from babeldoc.document_il import PdfParagraph
 from babeldoc.document_il import PdfParagraphComposition
 from babeldoc.document_il import PdfRectangle
+from babeldoc.document_il import PdfStyle, Box, VisualBbox
+from babeldoc.document_il import GraphicState
+from babeldoc.document_il import PdfSameStyleUnicodeCharacters
 from babeldoc.document_il.babeldoc_exception.BabelDOCException import ExtractTextError
 from babeldoc.document_il.utils.layout_helper import Layout
 from babeldoc.document_il.utils.layout_helper import add_space_dummy_chars
@@ -21,65 +24,121 @@ from babeldoc.document_il.utils.paragraph_helper import is_cid_paragraph
 from babeldoc.document_il.utils.style_helper import WHITE
 from babeldoc.translation_config import TranslationConfig
 from babeldoc.document_il.ocr.ocr_runner import OCR_Runner
-from babeldoc.document_il import PdfStyle, Box, VisualBbox
 
 from datetime import datetime
 logger = logging.getLogger(__name__)
 # Base58 alphabet (Bitcoin style, without numbers 0, O, I, l)
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
-def build_ocr_pdf_paragraph(ocr_results, layout_id='ocr-layout', font_id='OCR_FONT', font_size=10):
+def build_ocr_pdf_paragraph(ocr_results, layout_id=1, font_id=None, font_size=10):
     """
     ocr_results: list of {'text': str, 'bbox': [x0, y0, x1, y1]}
     Returns: PdfParagraph
     """
+    if not ocr_results:
+        return None
+
     characters = []
     char_id = 0
 
+    # Calculate the overall bounding box for the paragraph
+    x0 = min(result['bbox'][0] for result in ocr_results)
+    y0 = min(result['bbox'][1] for result in ocr_results)
+    x2 = max(result['bbox'][2] for result in ocr_results)
+    y2 = max(result['bbox'][3] for result in ocr_results)
+
+    # Create a graphic state with the example color settings
+    graphic_state = GraphicState(
+        linewidth=None,
+        dash=[],
+        flatness=None,
+        intent=None,
+        linecap=None,
+        linejoin=None,
+        miterlimit=None,
+        ncolor=[],
+        scolor=[],
+        stroking_color_space_name=None,
+        non_stroking_color_space_name=None,
+        passthrough_per_char_instruction='0 g 0 G'
+    )
+
+    # Create the pdf style
+    pdf_style = PdfStyle(
+        graphic_state=graphic_state,
+        font_id=font_id,
+        font_size=font_size
+    )
+
+    # Process each OCR result into individual characters
     for result in ocr_results:
         text = result['text']
-        x0, y0, x1, y1 = result['bbox']
-
-        # Each character gets its own PdfCharacter
-        for c in text:
-            char_box = Box(x=x0, y=y0, x2=x1, y2=y1)
-            visual_bbox = VisualBbox(box=char_box)
-            pdf_style = PdfStyle(font_id=font_id, font_size=font_size, graphic_state=None)
-
+        bbox = result['bbox']
+        
+        # Calculate character width for advance
+        char_width = (bbox[2] - bbox[0]) / len(text)
+        
+        for i, char in enumerate(text):
+            # Calculate individual character box
+            char_x0 = bbox[0] + (i * char_width)
+            char_x2 = char_x0 + char_width
+            
+            # Create character box and visual bbox
+            char_box = Box(x=char_x0, y=bbox[1], x2=char_x2, y2=bbox[3])
+            visual_bbox = VisualBbox(box=Box(
+                x=char_x0,
+                y=bbox[1] - 2,  # Adjust visual bbox slightly
+                x2=char_x2,
+                y2=bbox[3] + 2
+            ))
+            
+            # Create PdfCharacter
             pdf_char = PdfCharacter(
-                box=char_box,
-                pdf_character_id=char_id,
-                advance=(x1 - x0) / len(text),
-                char_unicode=c,
-                vertical=False,
                 pdf_style=pdf_style,
-                xobj_id=-1,
-                visual_bbox=visual_bbox
+                box=char_box,
+                visual_bbox=visual_bbox,
+                vertical=False,
+                scale=None,
+                pdf_character_id=char_id,
+                char_unicode=char,
+                advance=char_width,
+                xobj_id=0,
+                debug_info=True
             )
             characters.append(pdf_char)
             char_id += 1
-    if characters:
-    # Wrap characters into a single PdfLine
-        pdf_line = PdfLine(pdf_character=characters)
 
-        # Wrap line into PdfParagraphComposition
-        composition = PdfParagraphComposition(pdf_line=pdf_line)
+    # Create PdfLine with all characters
+    pdf_line = PdfLine(
+        box=Box(x=x0, y=y0, x2=x2, y2=y2),
+        pdf_character=characters
+    )
 
-        # Wrap everything into PdfParagraph
-        paragraph = PdfParagraph(
-            box=Box(x=min(c.box.x for c in characters),
-                    y=min(c.box.y for c in characters),
-                    x2=max(c.box.x2 for c in characters),
-                    y2=max(c.box.y2 for c in characters)),
-            pdf_paragraph_composition=[composition],
-            pdf_style=PdfStyle(font_id=font_id, font_size=font_size, graphic_state=None),
-            unicode=''.join([c.char_unicode for c in characters]),
-            layout_id=layout_id
-        )
+    # Create PdfParagraphComposition
+    composition = PdfParagraphComposition(
+        pdf_line=pdf_line,
+        pdf_formula=None,
+        pdf_same_style_characters=None,
+        pdf_character=None,
+        pdf_same_style_unicode_characters=None
+    )
 
-        return paragraph
-    else:
-        return None
+    # Create the final PdfParagraph
+    paragraph = PdfParagraph(
+        box=Box(x=x0, y=y0, x2=x2, y2=y2),
+        pdf_paragraph_composition=[composition],
+        pdf_style=None,  # Set to None as in example
+        unicode=' '.join(result['text'] for result in ocr_results),
+        layout_id=layout_id,
+        layout_label='plain text',
+        debug_id=generate_base58_id(),
+        first_line_indent=False,
+        vertical=False,
+        xobj_id=0,
+        scale=None
+    )
+
+    return paragraph
 
 def run_selective_ocr_on_empty_layouts(page, 
                                        full_page_image: np.ndarray, 
