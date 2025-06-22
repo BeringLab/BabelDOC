@@ -581,13 +581,23 @@ GLOBAL_NATS_CLIENT = GeneralNATSClient()
 def get_mt_job_unit_count(segment_text: str, source_language: str) -> int:
     """
     Calculates the unit count for a given text segment based on the source language.
-    - For languages without space-separated characters (e.g., Chinese, Japanese), it counts characters.
-    - For languages with space-separated characters, it counts words.
+    - For CJK languages (Korean, Chinese, Japanese), it counts characters.
+    - For other languages, it counts words.
     """
+    # Handle empty or whitespace-only text
+    if not segment_text or not segment_text.strip():
+        return 0
+    
+    # Split by whitespace
     words = segment_text.split()
     source_language_lower = source_language.lower()
 
-    if source_language_lower.startswith("zh") or source_language_lower == "ja":
+    # Character-based counting for CJK languages
+    if (
+        source_language_lower == "ko"
+        or source_language_lower.startswith("zh")
+        or source_language_lower == "ja"
+    ):
         return sum(len(word) for word in words)
     else:
         return len(words)
