@@ -578,6 +578,31 @@ class GeneralNATSClient:
 GLOBAL_NATS_CLIENT = GeneralNATSClient()
 
 
+def get_mt_job_unit_count(segment_text: str, source_language: str) -> int:
+    """
+    Calculates the unit count for a given text segment based on the source language.
+    - For CJK languages (Korean, Chinese, Japanese), it counts characters.
+    - For other languages, it counts words.
+    """
+    # Handle empty or whitespace-only text
+    if not segment_text or not segment_text.strip():
+        return 0
+    
+    # Split by whitespace
+    words = segment_text.split()
+    source_language_lower = source_language.lower()
+
+    # Character-based counting for CJK languages
+    if (
+        source_language_lower == "ko"
+        or source_language_lower.startswith("zh")
+        or source_language_lower == "ja"
+    ):
+        return sum(len(word) for word in words)
+    else:
+        return len(words)
+
+
 class TranslatorClient:
     def __init__(self, nats_url: str):
         self._nats_url: str = nats_url
@@ -587,9 +612,28 @@ class TranslatorClient:
         Translation request rewritten by Minsung Kim;
         Need significant refactoring later.
         """
-        # Publish MtPdfJobCreated
-        SUBJECT = "bering_workqueue.MtPdfJob.MtPdfJobCreated"
         job_id: int = request.job_id
+
+        # 1. Calculate the total unit count for the entire document.
+        total_unit_count = sum(
+            get_mt_job_unit_count(segment.segment, request.source_language)
+            for segment in request.payload
+        )
+
+        # 2. Publish the total unit count as a separate event.
+        DOCUMENT_UNIT_COUNT_SUBJECT = (
+            "bering_workqueue.MtDocumentJob.DocumentJobUnitCountCalculated"
+        )
+        unit_count_event = {
+            "job_id": job_id,
+            "total_unit_count": total_unit_count,
+        }
+        GLOBAL_NATS_CLIENT.publish(
+            DOCUMENT_UNIT_COUNT_SUBJECT, json.dumps(unit_count_event).encode()
+        )
+
+        # 3. Publish individual segment translation jobs.
+        SUBJECT = "bering_workqueue.MtPdfJob.MtPdfJobCreated"
         for segment in request.payload:
             segment_id: int = segment.segment_id
             event: PDFJobCreated = {
