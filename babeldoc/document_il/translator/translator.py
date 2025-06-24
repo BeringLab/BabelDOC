@@ -30,9 +30,11 @@ from nats.aio.subscription import Subscription as NATSSubscription
 
 logger = logging.getLogger(__name__)
 
-# Global tracking for unit count publications to prevent duplicates
+# Global tracking for unit count publications and segment collection
 _published_unit_counts = set()
 _unit_count_lock = threading.Lock()
+_document_segments = {}  # job_id -> list of segments with unit counts
+_segment_lock = threading.Lock()
 
 
 def remove_control_characters(s):
@@ -78,6 +80,50 @@ _translate_rate_limiter = RateLimiter(5)
 
 def set_translate_rate_limiter(max_qps):
     _translate_rate_limiter.set_max_qps(max_qps)
+
+
+def publish_document_unit_count(job_id: int):
+    """
+    Publish the total unit count for a document after all segments have been collected.
+    This should be called when document processing is complete.
+    """
+    with _unit_count_lock:
+        if job_id in _published_unit_counts:
+            logger.debug(f"Unit count already published for job_id: {job_id}")
+            return
+
+        with _segment_lock:
+            if job_id not in _document_segments:
+                logger.warning(f"No segments found for job_id: {job_id}")
+                return
+
+            segments = _document_segments[job_id]
+            total_unit_count = sum(seg['unit_count'] for seg in segments)
+            segment_count = len(segments)
+
+        # Publish the total unit count
+        DOCUMENT_UNIT_COUNT_SUBJECT = (
+            "bering_workqueue.MtDocumentJob.DocumentJobUnitCountCalculated"
+        )
+        unit_count_event = {
+            "job_id": job_id,
+            "total_unit_count": total_unit_count,
+            "segment_count": segment_count
+        }
+        GLOBAL_NATS_CLIENT.publish(
+            DOCUMENT_UNIT_COUNT_SUBJECT, json.dumps(unit_count_event).encode()
+        )
+
+        _published_unit_counts.add(job_id)
+        logger.info(f"Published total unit count {total_unit_count} for job_id: {job_id} ({segment_count} segments)")
+
+
+def cleanup_document_segments(job_id: int):
+    """Clean up collected segments after processing is complete."""
+    with _segment_lock:
+        if job_id in _document_segments:
+            del _document_segments[job_id]
+            logger.debug(f"Cleaned up segments for job_id: {job_id}")
 
 
 class BaseTranslator(ABC):
@@ -368,7 +414,7 @@ class ProcessedPayload(typing.TypedDict):
 class PDFSegmentProcessed(typing.TypedDict):
     """
     This is a event sent from the MT-worker to the Translation-Coordinator.
-    NATS subject: `bering_workqueue.mt_worker.mt_job.MtJobPdfSegmentProcessed`
+    NATS subject: `bering_workqueue.mt_worker.mt_job.MtJobSegmentProcessed`
     """
 
     job_id: int
@@ -397,7 +443,7 @@ class SegmentProcessedStorage:
     Storage for processed segment events.
     """
 
-    SUBJECT = "bering_workqueue.mt_worker.mt_job.MtJobPdfSegmentProcessed"
+    SUBJECT = "bering_workqueue.mt_worker.mt_job.MtJobDocumentSegmentProcessed"
 
     def __init__(self, nats_client: "GeneralNATSClient"):
         self._nats_client = nats_client
@@ -618,34 +664,22 @@ class TranslatorClient:
         """
         job_id: int = request.job_id
 
-        # 1. Calculate and publish unit count only once per job_id
-        with _unit_count_lock:
-            if job_id not in _published_unit_counts:
-                # Calculate the total unit count for this request's segments
-                total_unit_count = sum(
-                    get_mt_job_unit_count(segment.segment, request.source_language)
-                    for segment in request.payload
-                )
+        # Collect segments for unit count calculation
+        with _segment_lock:
+            if job_id not in _document_segments:
+                _document_segments[job_id] = []
 
-                # Publish the total unit count as a separate event
-                DOCUMENT_UNIT_COUNT_SUBJECT = (
-                    "bering_workqueue.MtDocumentJob.DocumentJobUnitCountCalculated"
-                )
-                unit_count_event = {
-                    "job_id": job_id,
-                    "total_unit_count": total_unit_count,
-                }
-                GLOBAL_NATS_CLIENT.publish(
-                    DOCUMENT_UNIT_COUNT_SUBJECT, json.dumps(unit_count_event).encode()
-                )
+            # Add current segments to the collection
+            for segment in request.payload:
+                segment_unit_count = get_mt_job_unit_count(segment.segment, request.source_language)
+                _document_segments[job_id].append({
+                    'segment': segment.segment,
+                    'unit_count': segment_unit_count,
+                    'segment_id': segment.segment_id
+                })
+                logger.debug(f"Added segment {segment.segment_id} with unit count {segment_unit_count} to job_id {job_id}")
 
-                # Mark this job_id as having published unit count
-                _published_unit_counts.add(job_id)
-                logger.info(f"Published unit count {total_unit_count} for job_id: {job_id}")
-            else:
-                logger.debug(f"Unit count already published for job_id: {job_id}, skipping")
-
-        # 2. Publish individual segment translation jobs.
+        # Publish individual segment translation jobs.
         SUBJECT = "bering_workqueue.MtPdfJob.MtPdfJobCreated"
         for segment in request.payload:
             segment_id: int = segment.segment_id
@@ -856,8 +890,12 @@ class BeringTranslator(BaseTranslator):
         if not text or not isinstance(text, str):
             return ""
 
-        # Use standard individual processing
-        job_id = self.job_id if self.job_id is not None else random.randint(1, 10**9)
+        # Use the job_id from initialization, not random
+        if self.job_id is None:
+            logger.error("No job_id set for BeringTranslator, this will cause unit count issues")
+            raise ValueError("job_id must be set for BeringTranslator")
+
+        job_id = self.job_id
         lang_in = self.lang_in or 'en'
         lang_out = self.lang_out or 'ko'
         domain = self.model or 'general'
