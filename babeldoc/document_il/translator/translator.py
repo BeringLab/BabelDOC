@@ -87,12 +87,15 @@ def publish_document_unit_count(job_id: int):
     Publish the total unit count for a document after all segments have been collected.
     This should be called when document processing is complete.
     """
+    logger.debug(f"Attempting to publish unit count for job_id: {job_id}")
+
     with _unit_count_lock:
         if job_id in _published_unit_counts:
             logger.debug(f"Unit count already published for job_id: {job_id}")
             return
 
         with _segment_lock:
+            logger.debug(f"Available job_ids in _document_segments: {list(_document_segments.keys())}")
             if job_id not in _document_segments:
                 logger.warning(f"No segments found for job_id: {job_id}")
                 return
@@ -100,6 +103,8 @@ def publish_document_unit_count(job_id: int):
             segments = _document_segments[job_id]
             total_unit_count = sum(seg['unit_count'] for seg in segments)
             segment_count = len(segments)
+
+            logger.debug(f"Calculated total_unit_count: {total_unit_count}, segment_count: {segment_count} for job_id: {job_id}")
 
         # Publish the total unit count
         DOCUMENT_UNIT_COUNT_SUBJECT = (
@@ -110,12 +115,22 @@ def publish_document_unit_count(job_id: int):
             "total_unit_count": total_unit_count,
             "segment_count": segment_count
         }
-        GLOBAL_NATS_CLIENT.publish(
-            DOCUMENT_UNIT_COUNT_SUBJECT, json.dumps(unit_count_event).encode()
-        )
 
-        _published_unit_counts.add(job_id)
-        logger.info(f"Published total unit count {total_unit_count} for job_id: {job_id} ({segment_count} segments)")
+        # Check if NATS client is connected before publishing
+        if not GLOBAL_NATS_CLIENT.is_connected():
+            logger.error(f"NATS client is not connected, cannot publish unit count for job_id: {job_id}")
+            return
+
+        logger.info(f"Publishing DocumentJobUnitCountCalculated message for job_id: {job_id}")
+        try:
+            GLOBAL_NATS_CLIENT.publish(
+                DOCUMENT_UNIT_COUNT_SUBJECT, json.dumps(unit_count_event).encode()
+            )
+            _published_unit_counts.add(job_id)
+            logger.info(f"Successfully published total unit count {total_unit_count} for job_id: {job_id} ({segment_count} segments)")
+        except Exception as e:
+            logger.error(f"Failed to publish DocumentJobUnitCountCalculated message for job_id {job_id}: {e}")
+            raise
 
 
 def cleanup_document_segments(job_id: int):
@@ -678,6 +693,17 @@ class TranslatorClient:
                     'segment_id': segment.segment_id
                 })
                 logger.debug(f"Added segment {segment.segment_id} with unit count {segment_unit_count} to job_id {job_id}")
+
+        # Check if this is the first segment collection for this job_id
+        segments_so_far = len(_document_segments[job_id])
+        logger.debug(f"Total segments collected so far for job_id {job_id}: {segments_so_far}")
+
+        # Only publish unit count if we haven't published it yet for this job_id
+        if job_id not in _published_unit_counts:
+            try:
+                publish_document_unit_count(job_id)
+            except Exception as e:
+                logger.error(f"Failed to publish unit count for job_id {job_id}: {e}")
 
         # Publish individual segment translation jobs.
         SUBJECT = "bering_workqueue.MtPdfJob.MtPdfJobCreated"
