@@ -562,6 +562,10 @@ class ILTranslator:
             if composition.pdf_line:
                 chars.extend(composition.pdf_line.pdf_character)
             elif composition.pdf_formula:
+                if disable_rich_text_translate:
+                    chars.extend(composition.pdf_formula.pdf_character)
+                    continue
+
                 formula_placeholder = self.create_formula_placeholder(
                     composition.pdf_formula,
                     placeholder_id,
@@ -572,6 +576,7 @@ class ILTranslator:
                 placeholder_id = formula_placeholder.id + 1
                 chars.extend(formula_placeholder.placeholder)
             elif composition.pdf_character:
+
                 chars.append(composition.pdf_character)
             elif composition.pdf_same_style_characters:
                 if disable_rich_text_translate:
