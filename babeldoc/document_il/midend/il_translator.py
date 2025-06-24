@@ -229,6 +229,17 @@ class ILTranslator:
             if title_paragraph:
                 logger.info(f"Found first title paragraph: {title_paragraph.unicode}")
 
+        # Initialize batch processing for BeringTranslator if available
+        is_bering_translator = (hasattr(self.translate_engine, 'start_batch_translation') and
+                               hasattr(self.translate_engine, 'end_batch_translation'))
+        if is_bering_translator:
+            try:
+                # Collect all translatable segments first for unit count calculation
+                self._prepare_batch_translation(docs)
+            except Exception as e:
+                logger.warning(f"Failed to prepare batch translation: {e}")
+                is_bering_translator = False
+
         # count total paragraph
         total = sum(len(page.pdf_paragraph) for page in docs.page)
         with self.translation_config.progress_monitor.stage_start(
@@ -243,6 +254,13 @@ class ILTranslator:
             ) as executor:
                 for page in docs.page:
                     self.process_page(page, executor, pbar, tracker.new_page())
+
+        # End batch processing for BeringTranslator if available
+        if is_bering_translator:
+            try:
+                self.translate_engine.end_batch_translation()
+            except Exception as e:
+                logger.warning(f"Failed to end batch translation: {e}")
 
         path = self.translation_config.get_working_file_path("translate_tracking.json")
 
@@ -267,6 +285,81 @@ class ILTranslator:
                     return paragraph
         return None
 
+    def _prepare_batch_translation(self, docs: Document):
+        """Prepare batch translation by collecting all segments and initializing batch mode."""
+        if not hasattr(self.translate_engine, 'start_batch_translation'):
+            return
+
+        # Generate a unique job_id for this document
+        import random
+        job_id = random.randint(1, 10**9)
+
+        # Start batch translation
+        self.translate_engine.start_batch_translation(job_id)
+
+        # Collect all translatable text segments for unit count calculation
+        translatable_segments = []
+        for page in docs.page:
+            if not hasattr(page, 'pdf_paragraph') or not page.pdf_paragraph:
+                continue
+
+            for paragraph in page.pdf_paragraph:
+                if not paragraph or not hasattr(paragraph, 'unicode') or paragraph.unicode is None:
+                    continue
+                if self._is_cid_paragraph(paragraph):
+                    continue
+
+                # Get the translatable input for this paragraph
+                page_font_map = {}
+                if hasattr(page, 'pdf_font') and page.pdf_font:
+                    for font in page.pdf_font:
+                        if hasattr(font, 'font_id'):
+                            page_font_map[font.font_id] = font
+
+                page_xobj_font_map = {}
+                if hasattr(page, 'pdf_xobject') and page.pdf_xobject:
+                    for xobj in page.pdf_xobject:
+                        if hasattr(xobj, 'xobj_id'):
+                            page_xobj_font_map[xobj.xobj_id] = page_font_map.copy()
+                            if hasattr(xobj, 'pdf_font') and xobj.pdf_font:
+                                for font in xobj.pdf_font:
+                                    if hasattr(font, 'font_id'):
+                                        page_xobj_font_map[xobj.xobj_id][font.font_id] = font
+
+                try:
+                    translate_input = self.get_translate_input(paragraph, page_font_map, False)
+                    if translate_input and hasattr(translate_input, 'text') and translate_input.text:
+                        text = translate_input.text
+                        if isinstance(text, str) and text.strip():
+                            translatable_segments.append(text)
+                            # Add segment to batch for unit count calculation
+                            if hasattr(self.translate_engine, 'add_segment_to_batch'):
+                                self.translate_engine.add_segment_to_batch(text)
+                except Exception as e:
+                    logger.debug(f"Failed to get translate input for paragraph: {e}")
+                    continue
+
+        logger.info(f"Prepared batch translation with {len(translatable_segments)} segments for job_id: {job_id}")
+
+    def _is_cid_paragraph(self, paragraph) -> bool:
+        """Check if paragraph contains CID characters that should be skipped."""
+        if not paragraph:
+            return True
+
+        try:
+            # Import the function from the appropriate module
+            from babeldoc.document_il.midend.il_translator_llm_only import is_cid_paragraph
+            return is_cid_paragraph(paragraph)
+        except ImportError:
+            # Fallback implementation
+            if not hasattr(paragraph, 'unicode') or not paragraph.unicode:
+                return True
+            # Simple check for CID-like patterns
+            unicode_text = paragraph.unicode
+            if not isinstance(unicode_text, str):
+                return True
+            return len(unicode_text.strip()) == 0 or unicode_text.strip().isspace()
+
     def process_page(
         self,
         page: Page,
@@ -275,32 +368,69 @@ class ILTranslator:
         tracker: PageTranslateTracker = None,
     ):
         self.translation_config.raise_if_cancelled()
+
+        if not page or not hasattr(page, 'pdf_paragraph') or not page.pdf_paragraph:
+            return
+
         for paragraph in page.pdf_paragraph:
+            if not paragraph or not hasattr(paragraph, 'unicode'):
+                continue
+
+            # Build font maps safely
             page_font_map = {}
-            for font in page.pdf_font:
-                page_font_map[font.font_id] = font
+            if hasattr(page, 'pdf_font') and page.pdf_font:
+                for font in page.pdf_font:
+                    if font and hasattr(font, 'font_id'):
+                        page_font_map[font.font_id] = font
+
             page_xobj_font_map = {}
-            for xobj in page.pdf_xobject:
-                page_xobj_font_map[xobj.xobj_id] = page_font_map.copy()
-                for font in xobj.pdf_font:
-                    page_xobj_font_map[xobj.xobj_id][font.font_id] = font
-            # self.translate_paragraph(paragraph, pbar,tracker.new_paragraph(), page_font_map, page_xobj_font_map)
-            paragraph_token_count = self.calc_token_count(paragraph.unicode)
-            if paragraph.layout_label == "title":
-                self.shared_context_cross_split_part.recent_title_paragraph = (
-                    copy.deepcopy(paragraph)
-                )
+            if hasattr(page, 'pdf_xobject') and page.pdf_xobject:
+                for xobj in page.pdf_xobject:
+                    if xobj and hasattr(xobj, 'xobj_id'):
+                        page_xobj_font_map[xobj.xobj_id] = page_font_map.copy()
+                        if hasattr(xobj, 'pdf_font') and xobj.pdf_font:
+                            for font in xobj.pdf_font:
+                                if font and hasattr(font, 'font_id'):
+                                    page_xobj_font_map[xobj.xobj_id][font.font_id] = font
+
+            # Calculate token count safely
+            paragraph_token_count = 0
+            if paragraph.unicode:
+                try:
+                    paragraph_token_count = self.calc_token_count(paragraph.unicode)
+                except Exception as e:
+                    logger.debug(f"Failed to calculate token count: {e}")
+                    paragraph_token_count = 0
+
+            # Update title paragraph safely
+            if hasattr(paragraph, 'layout_label') and paragraph.layout_label == "title":
+                if hasattr(self.shared_context_cross_split_part, 'recent_title_paragraph'):
+                    try:
+                        self.shared_context_cross_split_part.recent_title_paragraph = copy.deepcopy(paragraph)
+                    except Exception as e:
+                        logger.debug(f"Failed to update recent title paragraph: {e}")
+
+            # Submit translation task safely
+            if tracker:
+                try:
+                    paragraph_tracker = tracker.new_paragraph()
+                except Exception as e:
+                    logger.debug(f"Failed to create paragraph tracker: {e}")
+                    paragraph_tracker = None
+            else:
+                paragraph_tracker = None
+
             executor.submit(
                 self.translate_paragraph,
                 paragraph,
                 pbar,
-                tracker.new_paragraph(),
+                paragraph_tracker,
                 page_font_map,
                 page_xobj_font_map,
                 priority=1048576 - paragraph_token_count,
                 paragraph_token_count=paragraph_token_count,
-                title_paragraph=self.translation_config.shared_context_cross_split_part.first_paragraph,
-                local_title_paragraph=self.translation_config.shared_context_cross_split_part.recent_title_paragraph,
+                title_paragraph=getattr(self.translation_config.shared_context_cross_split_part, 'first_paragraph', None),
+                local_title_paragraph=getattr(self.translation_config.shared_context_cross_split_part, 'recent_title_paragraph', None),
             )
 
     class TranslateInput:

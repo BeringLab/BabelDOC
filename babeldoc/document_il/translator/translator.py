@@ -587,7 +587,7 @@ def get_mt_job_unit_count(segment_text: str, source_language: str) -> int:
     # Handle empty or whitespace-only text
     if not segment_text or not segment_text.strip():
         return 0
-    
+
     # Split by whitespace
     words = segment_text.split()
     source_language_lower = source_language.lower()
@@ -777,10 +777,10 @@ class BeringTranslator(BaseTranslator):
         lang_in: str,
         lang_out: str,
         model,
-        job_id: int,
-        ignore_cache: bool = False,
+        job_id: int = None,
+        ignore_cache: bool = True,
+        port: int = 4222,
         rate_limit_params=None,
-        port: int,
         **kwargs,
     ):
         super().__init__(lang_in, lang_out, ignore_cache)
@@ -789,6 +789,10 @@ class BeringTranslator(BaseTranslator):
         )
         self.model = model
         self.job_id = job_id
+        self.port = port
+        self._batch_segments = []  # Store segments for batch processing
+        self._batch_job_id = None
+        self._unit_count_published = False
 
     def validate_translate_args(self, job_id, lang_in, lang_out, domain):
         if not isinstance(job_id, int):
@@ -830,18 +834,82 @@ class BeringTranslator(BaseTranslator):
 
         return " ".join([" ".join(segment["segment"]) for segment in segments])
 
+    def add_segment_to_batch(self, text: str) -> int:
+        """Add a segment to the current batch and return its segment_id."""
+        if not text or not isinstance(text, str):
+            return 0
+        segment_id = int(segment_generator())
+        self._batch_segments.append({
+            'text': text,
+            'segment_id': segment_id
+        })
+        return segment_id
+
+    def start_batch_translation(self, job_id: int = None):
+        """Initialize a new batch translation session."""
+        if job_id is not None:
+            self._batch_job_id = job_id
+        elif self.job_id is not None:
+            self._batch_job_id = self.job_id
+        else:
+            self._batch_job_id = random.randint(1, 10**9)
+
+        self._batch_segments = []
+        self._unit_count_published = False
+        logger.info(f"Starting batch translation with job_id: {self._batch_job_id}")
+
+    def publish_total_unit_count(self):
+        """Calculate and publish total unit count for all segments in the batch."""
+        if self._unit_count_published or not self._batch_segments or self._batch_job_id is None:
+            return
+
+        try:
+            total_unit_count = sum(
+                get_mt_job_unit_count(segment['text'], self.lang_in or 'en')
+                for segment in self._batch_segments
+                if segment.get('text')
+            )
+
+            # Publish the total unit count as a separate event
+            DOCUMENT_UNIT_COUNT_SUBJECT = (
+                "bering_workqueue.MtDocumentJob.DocumentJobUnitCountCalculated"
+            )
+            unit_count_event = {
+                "job_id": self._batch_job_id,
+                "total_unit_count": total_unit_count,
+            }
+            GLOBAL_NATS_CLIENT.publish(
+                DOCUMENT_UNIT_COUNT_SUBJECT, json.dumps(unit_count_event).encode()
+            )
+
+            logger.info(f"Published total unit count: {total_unit_count} for job_id: {self._batch_job_id}")
+            self._unit_count_published = True
+        except Exception as e:
+            logger.error(f"Failed to publish total unit count: {e}")
+
     def do_translate(
         self,
         text,
         rate_limit_params: dict = None,
     ) -> str:
         logger.info(f"translate: {text}")
-        job_id = self.job_id or random.randint(1, 10**9)
-        lang_in = self.lang_in
-        lang_out = self.lang_out
-        domain = self.model
+
+        if not text or not isinstance(text, str):
+            return ""
+
+        # If batch processing is active, add to batch and process individually
+        if self._batch_job_id is not None:
+            return self._do_batch_segment_translate(text)
+
+        # Fallback to original single-segment processing
+        job_id = self.job_id if self.job_id is not None else random.randint(1, 10**9)
+        lang_in = self.lang_in or 'en'
+        lang_out = self.lang_out or 'ko'
+        domain = self.model or 'general'
+
         if not self.validate_translate_args(job_id, lang_in, lang_out, domain):
             raise ValueError("Invalid language or domain")
+
         request = TranslationRequest(
             job_id=job_id,
             source_language=lang_in,
@@ -853,6 +921,90 @@ class BeringTranslator(BaseTranslator):
         )
         result = self.client.translate(request)
         return self.parse_result(result)
+
+    def _do_batch_segment_translate(self, text: str) -> str:
+        """Process a single segment within a batch translation context."""
+        if self._batch_job_id is None:
+            raise ValueError("Batch job ID is not set")
+
+        job_id = self._batch_job_id
+        lang_in = self.lang_in or 'en'
+        lang_out = self.lang_out or 'ko'
+        domain = self.model or 'general'
+
+        if not self.validate_translate_args(job_id, lang_in, lang_out, domain):
+            raise ValueError("Invalid language or domain")
+
+        # Publish unit count once for the entire batch
+        self.publish_total_unit_count()
+
+        # Create individual segment request
+        segment_id = int(segment_generator())
+        request = TranslationRequest(
+            job_id=job_id,
+            source_language=lang_in,
+            target_language=lang_out,
+            domain=domain,
+            payload=[
+                TranslationSegment(segment=text, segment_id=segment_id)
+            ],
+        )
+
+        # Use direct segment processing instead of full request_and_retrieve
+        # to avoid duplicate unit count calculations
+        self._publish_individual_segment(request.payload[0], job_id, lang_in, lang_out, domain)
+
+        # Retrieve result for this specific segment
+        segment_results = []
+        try:
+            for decoded in GLOBAL_NATS_CLIENT.segment_processed_storage.get_processed_segments(
+                job_id, 1
+            ):
+                if decoded["job_id"] == job_id and decoded["segment_id"] == segment_id:
+                    segment_results.append(decoded)
+                    break
+        except Exception as e:
+            logger.error(f"Failed to retrieve segment results: {e}")
+            raise
+
+        if not segment_results:
+            raise ValueError(f"No translation result found for segment_id: {segment_id}")
+
+        # Parse and return the result
+        final_result = {
+            "job_id": job_id,
+            "translated_text_segment": [
+                {"segment": segment_results[0]["payload"]["main_text"]}
+            ],
+        }
+        return self.parse_result(final_result)
+
+    def _publish_individual_segment(self, segment: TranslationSegment, job_id: int,
+                                   source_language: str, target_language: str, domain: str):
+        """Publish individual segment translation job without unit count calculation."""
+        if job_id is None or not source_language or not target_language or not domain:
+            raise ValueError("Invalid parameters for segment publishing")
+
+        SUBJECT = "bering_workqueue.MtPdfJob.MtPdfJobCreated"
+        event: PDFJobCreated = {
+            "job_id": job_id,
+            "source_language": source_language,
+            "target_language": target_language,
+            "domain": domain,
+            "payload": {
+                "segment_id": segment.segment_id,
+                "segment": segment.segment,
+            },
+        }
+        GLOBAL_NATS_CLIENT.publish(SUBJECT, json.dumps(event).encode())
+
+    def end_batch_translation(self):
+        """Clean up batch translation session."""
+        if self._batch_job_id is not None:
+            logger.info(f"Ending batch translation for job_id: {self._batch_job_id}")
+        self._batch_job_id = None
+        self._batch_segments = []
+        self._unit_count_published = False
 
     # def do_llm_translate(self, text, rate_limit_params: dict = None):
     #     logger.info(f"translate: {text}")
