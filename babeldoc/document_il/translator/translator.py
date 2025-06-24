@@ -443,7 +443,7 @@ class SegmentProcessedStorage:
     Storage for processed segment events.
     """
 
-    SUBJECT = "bering_workqueue.mt_worker.mt_job.MtJobDocumentSegmentProcessed"
+    SUBJECT = "bering_workqueue.mt_worker.mt_job.MtJobPDFSegmentProcessed"
 
     def __init__(self, nats_client: "GeneralNATSClient"):
         self._nats_client = nats_client
