@@ -429,8 +429,14 @@ class ILTranslator:
         chars = []
         for composition in paragraph.pdf_paragraph_composition:
             if composition.pdf_line:
+                if disable_rich_text_translate:
+                    chars.extend(composition.pdf_line.pdf_character)
+                    continue
                 chars.extend(composition.pdf_line.pdf_character)
             elif composition.pdf_formula:
+                if disable_rich_text_translate:
+                    chars.extend(composition.pdf_formula.pdf_character)
+                    continue
                 formula_placeholder = self.create_formula_placeholder(
                     composition.pdf_formula,
                     placeholder_id,
