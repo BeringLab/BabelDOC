@@ -411,7 +411,7 @@ class ProcessedPayload(typing.TypedDict):
     main_text: list[str]
 
 
-class PDFSegmentProcessed(typing.TypedDict):
+class PdfSegmentProcessed(typing.TypedDict):
     """
     This is a event sent from the MT-worker to the Translation-Coordinator.
     NATS subject: `bering_workqueue.mt_worker.mt_job.MtJobSegmentProcessed`
@@ -443,11 +443,11 @@ class SegmentProcessedStorage:
     Storage for processed segment events.
     """
 
-    SUBJECT = "bering_workqueue.mt_worker.mt_job.MtJobPDFSegmentProcessed"
+    SUBJECT = "bering_workqueue.mt_worker.mt_job.MtJobPdfSegmentProcessed"
 
     def __init__(self, nats_client: "GeneralNATSClient"):
         self._nats_client = nats_client
-        self._processed_segments: dict[int, list[PDFSegmentProcessed]] = {}
+        self._processed_segments: dict[int, list[PdfSegmentProcessed]] = {}
 
     async def daemon(self) -> None:
         if self.SUBJECT not in self._nats_client.ongoing_subscriptions:
@@ -455,8 +455,8 @@ class SegmentProcessedStorage:
             await asyncio.sleep(3)
         async for message in self._nats_client.get_messages(self.SUBJECT):
             try:
-                decoded: PDFSegmentProcessed = json.loads(message)
-                logger.info("Received PDFSegmentProcessed: %s", decoded)
+                decoded: PdfSegmentProcessed = json.loads(message)
+                logger.info("Received PdfSegmentProcessed: %s", decoded)
                 job_id: int = decoded["job_id"]
                 if job_id not in self._processed_segments:
                     self._processed_segments[job_id] = []
@@ -696,7 +696,7 @@ class TranslatorClient:
             GLOBAL_NATS_CLIENT.publish(SUBJECT, json.dumps(event).encode())
 
         # Retrieve results
-        segment_results: list[PDFSegmentProcessed] = []
+        segment_results: list[PdfSegmentProcessed] = []
         for (
             decoded
         ) in GLOBAL_NATS_CLIENT.segment_processed_storage.get_processed_segments(
