@@ -229,16 +229,17 @@ class ILTranslator:
             if title_paragraph:
                 logger.info(f"Found first title paragraph: {title_paragraph.unicode}")
 
-        # Initialize batch processing for BeringTranslator if available
-        is_bering_translator = (hasattr(self.translate_engine, 'start_batch_translation') and
-                               hasattr(self.translate_engine, 'end_batch_translation'))
-        if is_bering_translator:
-            try:
-                # Collect all translatable segments first for unit count calculation
-                self._prepare_batch_translation(docs)
-            except Exception as e:
-                logger.warning(f"Failed to prepare batch translation: {e}")
-                is_bering_translator = False
+        # Temporarily disable batch processing to fix segment ID issues
+        is_bering_translator = False
+        # is_bering_translator = (hasattr(self.translate_engine, 'start_batch_translation') and
+        #                        hasattr(self.translate_engine, 'end_batch_translation'))
+        # if is_bering_translator:
+        #     try:
+        #         # Collect all translatable segments first for unit count calculation
+        #         self._prepare_batch_translation(docs)
+        #     except Exception as e:
+        #         logger.warning(f"Failed to prepare batch translation: {e}")
+        #         is_bering_translator = False
 
         # count total paragraph
         total = sum(len(page.pdf_paragraph) for page in docs.page)
@@ -256,11 +257,11 @@ class ILTranslator:
                     self.process_page(page, executor, pbar, tracker.new_page())
 
         # End batch processing for BeringTranslator if available
-        if is_bering_translator:
-            try:
-                self.translate_engine.end_batch_translation()
-            except Exception as e:
-                logger.warning(f"Failed to end batch translation: {e}")
+        # if is_bering_translator:
+        #     try:
+        #         self.translate_engine.end_batch_translation()
+        #     except Exception as e:
+        #         logger.warning(f"Failed to end batch translation: {e}")
 
         path = self.translation_config.get_working_file_path("translate_tracking.json")
 
@@ -288,6 +289,7 @@ class ILTranslator:
     def _prepare_batch_translation(self, docs: Document):
         """Prepare batch translation by collecting all segments and initializing batch mode."""
         if not hasattr(self.translate_engine, 'start_batch_translation'):
+            logger.debug("Translator doesn't support batch translation")
             return
 
         # Generate a unique job_id for this document
@@ -296,50 +298,49 @@ class ILTranslator:
 
         # Start batch translation
         self.translate_engine.start_batch_translation(job_id)
+        logger.debug(f"Started batch translation for job_id: {job_id}")
 
         # Collect all translatable text segments for unit count calculation
         translatable_segments = []
-        for page in docs.page:
+        total_paragraphs = 0
+
+        for page_idx, page in enumerate(docs.page):
+            logger.debug(f"Processing page {page_idx}")
+
             if not hasattr(page, 'pdf_paragraph') or not page.pdf_paragraph:
+                logger.debug(f"Page {page_idx} has no paragraphs")
                 continue
 
-            for paragraph in page.pdf_paragraph:
-                if not paragraph or not hasattr(paragraph, 'unicode') or paragraph.unicode is None:
-                    continue
-                if self._is_cid_paragraph(paragraph):
-                    continue
+            for para_idx, paragraph in enumerate(page.pdf_paragraph):
+                total_paragraphs += 1
+                logger.debug(f"Processing paragraph {para_idx} on page {page_idx}")
 
-                # Get the translatable input for this paragraph
-                page_font_map = {}
-                if hasattr(page, 'pdf_font') and page.pdf_font:
-                    for font in page.pdf_font:
-                        if hasattr(font, 'font_id'):
-                            page_font_map[font.font_id] = font
-
-                page_xobj_font_map = {}
-                if hasattr(page, 'pdf_xobject') and page.pdf_xobject:
-                    for xobj in page.pdf_xobject:
-                        if hasattr(xobj, 'xobj_id'):
-                            page_xobj_font_map[xobj.xobj_id] = page_font_map.copy()
-                            if hasattr(xobj, 'pdf_font') and xobj.pdf_font:
-                                for font in xobj.pdf_font:
-                                    if hasattr(font, 'font_id'):
-                                        page_xobj_font_map[xobj.xobj_id][font.font_id] = font
-
-                try:
-                    translate_input = self.get_translate_input(paragraph, page_font_map, False)
-                    if translate_input and hasattr(translate_input, 'text') and translate_input.text:
-                        text = translate_input.text
-                        if isinstance(text, str) and text.strip():
-                            translatable_segments.append(text)
-                            # Add segment to batch for unit count calculation
-                            if hasattr(self.translate_engine, 'add_segment_to_batch'):
-                                self.translate_engine.add_segment_to_batch(text)
-                except Exception as e:
-                    logger.debug(f"Failed to get translate input for paragraph: {e}")
+                if not paragraph:
+                    logger.debug(f"Paragraph {para_idx} is None")
                     continue
 
-        logger.info(f"Prepared batch translation with {len(translatable_segments)} segments for job_id: {job_id}")
+                if not hasattr(paragraph, 'unicode'):
+                    logger.debug(f"Paragraph {para_idx} has no unicode attribute")
+                    continue
+
+                if paragraph.unicode is None:
+                    logger.debug(f"Paragraph {para_idx} has None unicode")
+                    continue
+
+                # Simplified approach: use paragraph.unicode directly for batch collection
+                text = paragraph.unicode
+                if isinstance(text, str) and text.strip():
+                    # Skip CID paragraphs with simple check
+                    if len(text.strip()) > 0 and not text.strip().isspace():
+                        translatable_segments.append(text)
+                        logger.debug(f"Added segment: '{text[:50]}...'")
+                        # Add segment to batch for unit count calculation
+                        if hasattr(self.translate_engine, 'add_segment_to_batch'):
+                            self.translate_engine.add_segment_to_batch(text)
+                else:
+                    logger.debug(f"Paragraph {para_idx} text not suitable: '{text}'")
+
+        logger.info(f"Prepared batch translation with {len(translatable_segments)} segments from {total_paragraphs} total paragraphs for job_id: {job_id}")
 
     def _is_cid_paragraph(self, paragraph) -> bool:
         """Check if paragraph contains CID characters that should be skipped."""
